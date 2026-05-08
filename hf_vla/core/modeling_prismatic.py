@@ -2077,21 +2077,21 @@ class ExpVLAForActionPrediction(OpenVLAForActionPrediction):
         te, tm = get_text_emb_and_mask('p_front_ids')
         add_component(te, tm)
         add_component(front_embeds) # shape: [B, 256, 4096]
-        print("front_embeds shape", front_embeds.size())
+        # print("front_embeds shape", front_embeds.size())
         
         te, tm = get_text_emb_and_mask('p_rear_ids')
         add_component(te, tm)
         add_component(rear_embeds)
-        print("rear_embeds shape", rear_embeds.size())
+        # print("rear_embeds shape", rear_embeds.size())
         te, tm = get_text_emb_and_mask('p_left_ids')
         add_component(te, tm)
         add_component(left_embeds)
-        print("left_embeds shape", left_embeds.size())
+        # print("left_embeds shape", left_embeds.size())
         
         te, tm = get_text_emb_and_mask('p_right_ids')
         add_component(te, tm)
         add_component(right_embeds)
-        print("right_embeds shape", right_embeds.size())
+        # print("right_embeds shape", right_embeds.size())
         
         te, tm = get_text_emb_and_mask('p_hist_ids')
         add_component(te, tm)
@@ -2109,7 +2109,7 @@ class ExpVLAForActionPrediction(OpenVLAForActionPrediction):
         inputs_embeds = torch.cat(embeds_list, dim=1) # [4, 1191, 4096]
         attention_mask = torch.cat(masks_list, dim=1) # [4, 1191]
         
-        print("inputs_embeds shape", inputs_embeds.size())
+        # print("inputs_embeds shape", inputs_embeds.size())
         # print("attention_mask shape", attention_mask.size())
         
         # === 5. 大语言模型 Forward ===
@@ -2125,3 +2125,161 @@ class ExpVLAForActionPrediction(OpenVLAForActionPrediction):
             logits=outputs.logits,
             hidden_states=outputs.hidden_states
         )
+
+
+# ============================================================
+# ClassicVLAForActionPrediction: 文本自回归版，无外挂头
+# ============================================================
+
+class ClassicVLAForActionPrediction(OpenVLAForActionPrediction):
+    """
+    经典文本 VLA：历史轨迹已在 dataset 侧文本化，输入只有图像+文本 token。
+    训练时计算标准 CE loss（只对 output JSON token），推理时调用 generate()。
+    不依赖任何外挂头（past_traj_projector / action_head / decision_head）。
+    """
+    config_class = OpenVLAConfig
+
+    def __init__(self, config: OpenVLAConfig):
+        super().__init__(config)
+
+    def forward(
+        self,
+        batch_inputs,
+        use_cache=False,
+    ):
+        """
+        训练：batch_inputs 中含 output_ids / eos_ids，自动构造 labels 并返回 loss。
+        推理：batch_inputs 中不含 output_ids，只返回 prompt 对应的 inputs_embeds 和
+              attention_mask，供外层调用 generate()。
+        """
+        device = self.language_model.device
+        dtype = self.language_model.dtype
+        embed_layer = self.get_input_embeddings()
+        pad_id = batch_inputs.get('pad_token_id', 0)
+        B = batch_inputs['pixel_values_front'].shape[0]
+
+        # === 1. 视觉特征提取 ===
+        def encode_img(img_tensor):
+            patches = self.vision_backbone(img_tensor.to(dtype).to(device))
+            return self.projector(patches)  # [B, num_patches, llm_dim]
+
+        front_embeds = encode_img(batch_inputs['pixel_values_front'])
+        rear_embeds  = encode_img(batch_inputs['pixel_values_rear'])
+        left_embeds  = encode_img(batch_inputs['pixel_values_left'])
+        right_embeds = encode_img(batch_inputs['pixel_values_right'])
+        num_patches  = front_embeds.shape[1]  # typically 256
+
+        # === 2. Prompt embedding 组装 ===
+        bos_id = torch.tensor([[self.config.text_config.bos_token_id]] * B, device=device)
+
+        embeds_list = []
+        masks_list  = []
+        # labels_list 用于训练时的 loss mask：prompt 部分填 IGNORE_INDEX
+        labels_list = []
+
+        def add_text(key):
+            ids  = batch_inputs[key].to(device)           # [B, L]
+            emb  = embed_layer(ids)                       # [B, L, D]
+            mask = (ids != pad_id)                        # [B, L] bool
+            embeds_list.append(emb)
+            masks_list.append(mask)
+            # prompt 部分 label 全部忽略
+            lbl = torch.full(ids.shape, IGNORE_INDEX, dtype=torch.long, device=device)
+            labels_list.append(lbl)
+
+        def add_vision(emb):
+            embeds_list.append(emb)
+            masks_list.append(torch.ones(emb.shape[:2], dtype=torch.bool, device=device))
+            labels_list.append(torch.full(emb.shape[:2], IGNORE_INDEX, dtype=torch.long, device=device))
+
+        # [BOS]
+        bos_emb = embed_layer(bos_id)
+        embeds_list.append(bos_emb)
+        masks_list.append(torch.ones((B, 1), dtype=torch.bool, device=device))
+        labels_list.append(torch.full((B, 1), IGNORE_INDEX, dtype=torch.long, device=device))
+
+        # prompt 各段
+        add_text('sys_prompt_ids')
+        add_text('instruct_ids')
+        add_text('p_front_ids');  add_vision(front_embeds)
+        add_text('p_rear_ids');   add_vision(rear_embeds)
+        add_text('p_left_ids');   add_vision(left_embeds)
+        add_text('p_right_ids');  add_vision(right_embeds)
+        add_text('p_hist_ids')    # 历史轨迹已嵌入此文本中
+        add_text('p_slots_ids')
+        add_text('p_answer_ids')
+
+        prompt_embeds  = torch.cat(embeds_list, dim=1)   # [B, P, D]
+        prompt_mask    = torch.cat(masks_list,  dim=1)   # [B, P]
+        prompt_labels  = torch.cat(labels_list, dim=1)   # [B, P]
+        
+        # print("prompt_embeds shape", prompt_embeds.size()) # shape: [4, 1307, 4096]
+
+        is_training = 'output_ids' in batch_inputs
+
+        if is_training:
+            # === 3. 拼接输出 JSON + EOS 的 embedding 和 label ===
+            out_ids  = batch_inputs['output_ids'].to(device)   # [B, Lo]
+            eos_ids  = batch_inputs['eos_ids'].to(device)      # [B, 1]
+
+            out_emb  = embed_layer(out_ids)                    # [B, Lo, D]
+            eos_emb  = embed_layer(eos_ids)                    # [B, 1, D]
+
+            out_mask = (out_ids != pad_id)                     # [B, Lo]
+            eos_mask = torch.ones((B, 1), dtype=torch.bool, device=device)
+
+            # labels：output_ids padding 位置也忽略
+            out_lbl  = out_ids.clone()
+            out_lbl[out_ids == pad_id] = IGNORE_INDEX
+            eos_lbl  = eos_ids.clone()                         # EOS token 参与 loss
+
+            inputs_embeds  = torch.cat([prompt_embeds, out_emb, eos_emb], dim=1)
+            attention_mask = torch.cat([prompt_mask,   out_mask, eos_mask], dim=1)
+            # labels 整体右移一位（next-token prediction）：labels[i] 对应 input[i+1] 的预测目标
+            # 标准做法：直接传给 language_model，它内部做 shift
+            labels = torch.cat([prompt_labels, out_lbl, eos_lbl], dim=1) # shape: [4, 1480, 4096]
+            # print("inputs_embeds shape", inputs_embeds.size())
+
+            outputs = self.language_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                labels=labels,
+                use_cache=use_cache,
+                return_dict=True,
+            )
+            return outputs  # outputs.loss 即为 JSON token 的 CE loss
+
+        else:
+            # === 推理模式：只返回 prompt 的 embeds 和 mask，供 generate() 使用 ===
+            return prompt_embeds, prompt_mask
+
+    def generate_answer(
+        self,
+        batch_inputs,
+        max_new_tokens: int = 512,
+        **generate_kwargs,
+    ) -> list:
+        """
+        推理入口。返回新生成的 token ids（不含 prompt 部分）。
+        """
+        training = self.training
+        self.eval()
+
+        prompt_embeds, prompt_mask = self.forward(batch_inputs)
+        # prompt_mask is bool; convert to long so attention mask extensions via new_ones() stay consistent
+        prompt_mask = prompt_mask.long()
+
+        generated_ids = self.language_model.generate(
+            inputs_embeds=prompt_embeds,
+            attention_mask=prompt_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            **generate_kwargs,
+        )
+
+        # When generate() is called with inputs_embeds (no input_ids), HuggingFace initialises
+        # an empty input_ids tensor of shape (B, 0) and appends only the newly generated tokens.
+        # The returned tensor therefore contains ONLY the new tokens — no slicing needed.
+        if training:
+            self.train()
+        return generated_ids

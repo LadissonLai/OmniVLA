@@ -10,6 +10,7 @@ from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from accelerate import PartialState
 from peft import LoraConfig, get_peft_model
@@ -40,26 +41,28 @@ from core.utils import visualize_train_expvla
 
 @dataclass
 class ExpVLAConfig:
-    vla_path: str = "/public/home/lqq_202430131053/codes/OmniVLA/omnivla-original"
+    vla_path: str = "/public/home/lqq_202430131053/codes/OmniVLA/merged/openvla-7b-classic-merged"
     data_root: str = "/public/home/lqq_202430131053/codes/datasets/ParkingVLA"
-    run_root_dir: Path = Path("runs_expvla_causal_mask")
+    run_root_dir: Path = Path("runs_expvla_2_decode_smart_history_OFT")
     
-    batch_size: int = 3
+    # 学习率动态调节
+    batch_size: int = 2
     learning_rate: float = 1e-4
     grad_accumulation_steps: int = 8
-    epochs: int = 2
-    save_freq: int = 16
-    resume: bool = True
-    resume_dir: str = "runs_expvla/2026-04-23_23-09/step_96_checkpoint"
-    
+    epochs: int = 16
+    save_freq: int = 512
+    resume: bool = False
+    resume_dir: str = ""
     num_workers: int = 2
+    lr_warmup_steps: int = 500
+    num_steps_before_decay: int = 2000
     
     # visulization
     visualize_traj: bool = True
-    visualize_dir: str = "vis_exp"
+    visualize_dir: str = "vis_exp_smart_history_OFT_train"
     
     # History Trajectory 配置
-    history_mode: str = 'fixed_count'   # fixed_count: 采取固定数量的历史轨迹，如果大于8个则等间隔采用，如果少于8个则取少于8个，如果为0，则添加1个全0轨迹；
+    history_mode: str = 'smart'   # fixed_count: 采取固定数量的历史轨迹，如果大于8个则等间隔采用，如果少于8个则取少于8个，如果为0，则添加1个全0轨迹；
                                         # distance_interval: 采取固定距离间隔的历史轨迹，每隔一定距离采样一个轨迹点，数量动态变化。
                                         # smart: 如果历史为0，则添加1个全0轨迹； 动态数量历史轨迹，直线稀疏采样，弯道密集采样。
     distance_interval: float = 0.5      # for fixed_distance mode, in meters
@@ -72,14 +75,17 @@ class ExpVLAConfig:
     lora_dropout: float = 0.05
     
     # Logging
+    wandb_dir: str = "wandb_expvla_smart_history_OFT"
     wandb_entity: str = "your-wandb-entity"
     wandb_project: str = "ExpVLA-Parking"
-    wandb_log_freq: int = 8
+    wandb_log_freq: int = 64
     
+    
+
     # 损失权重
-    W_ACT = 1.0
-    W_SMOOTH = 0.1
-    W_DEC = 2.0
+    W_ACT = 1.5
+    W_SMOOTH = 0.5
+    W_DEC = 1.0
     W_OBJ = 0.5
 
 def wrap_ddp(module, device_id):
@@ -120,7 +126,7 @@ def train_expvla(cfg: ExpVLAConfig):
     torch.cuda.set_device(device_id)
     
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name="expvla_training")
+        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name="expvla_training", dir=cfg.wandb_dir)
         os.makedirs(cfg.run_root_dir, exist_ok=True)
         
     # === 1. 处理器与模型加载 ===
@@ -223,6 +229,14 @@ def train_expvla(cfg: ExpVLAConfig):
                        list(action_head.parameters()) + \
                        list(decision_head.parameters())
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+
+    # 学习率预热与衰减
+    original_lr = optimizer.param_groups[0]["lr"]
+    scheduler = MultiStepLR(
+        optimizer,
+        milestones=[cfg.num_steps_before_decay],
+        gamma=0.1,
+    )
     
     mse_loss = nn.MSELoss()
     ce_loss = nn.CrossEntropyLoss()
@@ -270,12 +284,13 @@ def train_expvla(cfg: ExpVLAConfig):
                 l_action = mse_loss(pred_actions, gt_action)
                 l_obj = mse_loss(pred_actions[:, -1, 0:2], gt_action[:, -1, 0:2])
                 
-                diff_pred = pred_actions[:, 1:, :] - pred_actions[:, :-1, :]
-                diff_gt = gt_action[:, 1:, :] - gt_action[:, :-1, :]
-                l_smooth = mse_loss(diff_pred, diff_gt)
+                # diff_pred = pred_actions[:, 1:, :] - pred_actions[:, :-1, :]
+                # diff_gt = gt_action[:, 1:, :] - gt_action[:, :-1, :]
+                # l_smooth = mse_loss(diff_pred, diff_gt)
                 l_decision = ce_loss(pred_decision_logits, gt_decision)
                 
-                total_loss = cfg.W_ACT * l_action + cfg.W_OBJ * l_obj + cfg.W_SMOOTH * l_smooth + cfg.W_DEC * l_decision
+                # total_loss = cfg.W_ACT * l_action + cfg.W_OBJ * l_obj + cfg.W_SMOOTH * l_smooth + cfg.W_DEC * l_decision
+                total_loss = cfg.W_ACT * l_action + cfg.W_OBJ * l_obj + cfg.W_DEC * l_decision
                 
                 # Normalize loss to account for gradient accumulation
                 normalized_loss = total_loss / cfg.grad_accumulation_steps
@@ -285,7 +300,17 @@ def train_expvla(cfg: ExpVLAConfig):
             recent_losses.append(total_loss.item())
 
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+                gradient_step_idx = global_step // cfg.grad_accumulation_steps
+                
+                # [If applicable] Linearly warm up learning rate from 10% to 100% of original
+                if cfg.lr_warmup_steps > 0:
+                    lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)
+                    current_lr = original_lr * (0.1 + 0.9 * lr_progress)
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = current_lr
+
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
                 
             global_step += 1
@@ -315,32 +340,17 @@ def train_expvla(cfg: ExpVLAConfig):
                     wandb.log({
                         "Loss/Total": sum(recent_losses)/len(recent_losses),
                         "Loss/Action": l_action.item(),
-                        "Loss/Smooth": l_smooth.item(),
+                        # "Loss/Smooth": l_smooth.item(),
                         "Loss/Obj (Endpoint)": l_obj.item(),
-                        "Loss/Decision": l_decision.item()
+                        "Loss/Decision": l_decision.item(),
+                        "Learning Rate": scheduler.get_last_lr()[0],
                     }, step=global_step)
                     
-                    if getattr(cfg, "visualize_traj", False):
-                        pred_decisions = pred_decision_logits.argmax(dim=-1)
-                        pred_decisions_str = [tokenizer.decode(idx.item()) for idx in pred_decisions]
-                        gt_decisions_str = [tokenizer.decode(idx.item()) if idx.item() >= 0 else "IGNORE" for idx in gt_decision]
-                        visualize_train_expvla(
-                            project_folder=visualize_dir,
-                            pred_actions=pred_actions,
-                            gt_actions=gt_action,
-                            pred_decisions=pred_decisions_str,
-                            gt_decisions=gt_decisions_str,
-                            instructions=batch.get('instruction', ["No instruction"] * pred_actions.shape[0]),
-                            images_front=batch['pixel_values_front'],
-                            images_rear=batch['pixel_values_rear'],
-                            images_left=batch['pixel_values_left'],
-                            images_right=batch['pixel_values_right'],
-                            epoch=epoch,
-                            step=global_step,
-                        )
+                    
                 
-                # save Checkpoint
-                if global_step > 0 and global_step % cfg.save_freq == 0:
+            # save Checkpoint (all ranks wait)
+            if global_step > 0 and global_step % cfg.save_freq == 0:
+                if distributed_state.is_main_process:
                     save_training_checkpoint(
                         cfg=cfg,
                         run_dir=save_ckpt_dir,
@@ -352,6 +362,42 @@ def train_expvla(cfg: ExpVLAConfig):
                         decision_head=decision_head,
                         loss=total_loss.item(),
                     )
+                distributed_state.wait_for_everyone()
+                
+                if getattr(cfg, "visualize_traj", False):
+                    pred_decisions = pred_decision_logits.argmax(dim=-1)
+                    pred_decisions_str = [tokenizer.decode(idx.item()) for idx in pred_decisions]
+                    gt_decisions_str = [tokenizer.decode(idx.item()) if idx.item() >= 0 else "IGNORE" for idx in gt_decision]
+                    visualize_train_expvla(
+                        project_folder=visualize_dir,
+                        pred_actions=pred_actions,
+                        gt_actions=gt_action,
+                        pred_decisions=pred_decisions_str,
+                        gt_decisions=gt_decisions_str,
+                        instructions=batch.get('instruction', ["No instruction"] * pred_actions.shape[0]),
+                        images_front=batch['pixel_values_front'],
+                        images_rear=batch['pixel_values_rear'],
+                        images_left=batch['pixel_values_left'],
+                        images_right=batch['pixel_values_right'],
+                        epoch=epoch,
+                        step=global_step,
+                    )
+                
+    if distributed_state.is_main_process:
+        save_training_checkpoint(
+                        cfg=cfg,
+                        run_dir=save_ckpt_dir,
+                        log_step=global_step,
+                        vla=vla,
+                        processor=processor,
+                        past_traj_projector=past_traj_projector,
+                        action_head=action_head,
+                        decision_head=decision_head,
+                        loss=total_loss.item(),
+                    )
+        distributed_state.wait_for_everyone()
+        print("🎉 Training completed!")
+        wandb.finish()
 
 if __name__ == "__main__":
     train_expvla()

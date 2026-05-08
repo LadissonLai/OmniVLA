@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import torch
 import numpy as np
 import pandas as pd
@@ -17,23 +18,27 @@ from core.processing_prismatic import PrismaticImageProcessor, PrismaticProcesso
 from core.configuration_prismatic import OpenVLAConfig
 from core.exp_parking_dataset import to_local_coords, custom_collate_fn, SingleTrajTestDataset
 from core.modeling_prismatic import ExpVLAForActionPrediction
-from core.utils import model_is_on_hf_hub
+from core.utils import model_is_on_hf_hub, visualize_test_expvla
 from core.constants import FUTURE_ACTION_WAYPOINTS, ACTION_DIM
 
 @dataclass
 class TestConfig:
-    vla_path: str = "/public/home/lqq_202430131053/codes/OmniVLA/omnivla-original"
-    resume_dir: str = "/public/home/lqq_202430131053/codes/OmniVLA/runs_expvla-good/2026-04-01_20-08/step_78592_checkpoint"
+    vla_path: str = "/public/home/lqq_202430131053/codes/OmniVLA/openvla-7b"
+    resume_dir: str = "/public/home/lqq_202430131053/codes/OmniVLA/runs_expvla_2_decode_smart_history/2026-05-06_22-18/step_59744_loss_0.0130_ckpt"
     data_root: str = "/public/home/lqq_202430131053/codes/datasets/ParkingVLA_Val" # 测试集路径
-    output_file: str = "test_metrics_result.txt"
+    output_file: str = "test_expvla_smart_history_16epoch.txt"
     
     # History Trajectory 配置，与训练一致
-    history_mode: str = 'fixed_count'
+    history_mode: str = 'smart'
     max_history: int = 8
     future_steps: int = 8
     distance_interval: float = 0.5
     turn_yaw_thresh: float = 5.0
     turn_dense_interval: float = 0.1
+    
+    # 可视化配置
+    save_vis: bool = True
+    vis_dir: str = "vis_expvla_smart_history_result"
 
 def calc_l2_distance(pred, gt):
     """计算单个时间点的 (x,y) L2 欧氏距离, 单位 m"""
@@ -108,7 +113,8 @@ def evaluate_model(cfg: TestConfig):
         "yaw_2s": [],
         "yaw_3s": [],
         "dec_acc": [],
-        "parking_success": []
+        "parking_success": [],
+        "inf_time": []
     }
     
     with open(cfg.output_file, 'w') as f:
@@ -134,6 +140,7 @@ def evaluate_model(cfg: TestConfig):
         traj_yaw_1s = []
         traj_yaw_2s = []
         traj_yaw_3s = []
+        traj_inf_time = []
         correct_decision = 0
         total_steps = len(dataset)
         
@@ -143,6 +150,7 @@ def evaluate_model(cfg: TestConfig):
             gt_action = batch['action_gt'].to(device).to(torch.bfloat16)
             gt_decision = batch['decision_gt'].to(device)
             
+            start_time = time.time()
             with torch.no_grad():
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     outputs = vla(batch, past_traj_projector=past_traj_projector)
@@ -155,6 +163,9 @@ def evaluate_model(cfg: TestConfig):
                     pred_decision_logits = decision_head(decision_hidden)
                     pred_actions_flat = action_head(actions_hidden).squeeze(-1)
                     pred_actions = pred_actions_flat.view(-1, FUTURE_ACTION_WAYPOINTS, ACTION_DIM)
+            end_time = time.time()
+            
+            traj_inf_time.append(end_time - start_time)
             
             pred_point_1s = pred_actions[0, 1, 0:4].cpu().float() # 1秒 (第2个点，idx 1)
             pred_point_2s = pred_actions[0, 3, 0:4].cpu().float() # 2秒 (第4个点，idx 3)
@@ -177,6 +188,41 @@ def evaluate_model(cfg: TestConfig):
             if pred_dec.item() == gt_decision[0].item():
                 correct_decision += 1
                 
+            # Use visualization
+            if cfg.save_vis:
+                vis_dir = cfg.vis_dir
+                if not os.path.isabs(vis_dir):
+                    out_dir = os.path.dirname(cfg.output_file)
+                    vis_dir = os.path.join(out_dir, vis_dir) if out_dir else vis_dir
+                    
+                traj_name = os.path.basename(traj_dir)
+                vis_save_path = os.path.join(vis_dir, traj_name, f"step_{step}.png")
+                instruction = batch.get('instruction', [""])[0] if 'instruction' in batch else "No instruction"
+                
+                history_traj = batch.get('history_traj')
+                if history_traj is not None and len(history_traj) > 0:
+                    history_traj = history_traj[0]
+                else:
+                    history_traj = None
+                
+                # Decode decisions
+                pred_dec_str = tokenizer.decode(pred_dec.item()).replace("<pad>", "").strip()
+                gt_dec_str = tokenizer.decode(gt_decision[0].item()).replace("<pad>", "").strip()
+                    
+                visualize_test_expvla(
+                    vis_save_path,
+                    pred_actions[0],
+                    gt_action[0],
+                    history_traj,
+                    pred_dec_str,
+                    gt_dec_str,
+                    instruction,
+                    batch['pixel_values_front'][0] if 'pixel_values_front' in batch else torch.zeros(3, 224, 224),
+                    batch['pixel_values_rear'][0] if 'pixel_values_rear' in batch else torch.zeros(3, 224, 224),
+                    batch['pixel_values_left'][0] if 'pixel_values_left' in batch else torch.zeros(3, 224, 224),
+                    batch['pixel_values_right'][0] if 'pixel_values_right' in batch else torch.zeros(3, 224, 224)
+                )
+
             # Parking Success check (last step)
             if step == total_steps - 1:
                 last_step_success = (pred_dec.item() == gt_decision[0].item())
@@ -188,6 +234,7 @@ def evaluate_model(cfg: TestConfig):
         avg_yaw_1s = np.mean(traj_yaw_1s)
         avg_yaw_2s = np.mean(traj_yaw_2s)
         avg_yaw_3s = np.mean(traj_yaw_3s)
+        avg_inf_time = np.mean(traj_inf_time)
         dec_acc = correct_decision / total_steps
         
         global_results['l2_1s'].append(avg_l2_1s)
@@ -198,6 +245,7 @@ def evaluate_model(cfg: TestConfig):
         global_results['yaw_3s'].append(avg_yaw_3s)
         global_results['dec_acc'].append(dec_acc)
         global_results['parking_success'].append(1 if last_step_success else 0)
+        global_results['inf_time'].append(avg_inf_time)
         
         traj_name = os.path.basename(traj_dir)
         with open(cfg.output_file, 'a') as f:
@@ -205,6 +253,7 @@ def evaluate_model(cfg: TestConfig):
             f.write(f"  L2 Dist 1s: {avg_l2_1s:.4f} m | L2 Dist 2s: {avg_l2_2s:.4f} m | L2 Dist 3s: {avg_l2_3s:.4f} m\n")
             f.write(f"  Yaw Error 1s: {avg_yaw_1s:.4f} rad | Yaw Error 2s: {avg_yaw_2s:.4f} rad | Yaw Error 3s: {avg_yaw_3s:.4f} rad\n")
             f.write(f"  Decision Acc: {dec_acc*100:.2f}%\n")
+            f.write(f"  Avg Inference Time: {avg_inf_time:.4f} s/step\n")
             f.write(f"  Parking Success: {'Yes' if last_step_success else 'No'}\n\n")
 
     # 全局统计
@@ -216,6 +265,7 @@ def evaluate_model(cfg: TestConfig):
     final_yaw_3s = np.mean(global_results['yaw_3s'])
     final_dec_acc = np.mean(global_results['dec_acc'])
     final_parking_success = np.mean(global_results['parking_success'])
+    final_inf_time = np.mean(global_results['inf_time'])
     
     summary = (
         "========== Global Summary ==========\n"
@@ -227,6 +277,7 @@ def evaluate_model(cfg: TestConfig):
         f"Average Yaw Err 2s (4th pt):   {final_yaw_2s:.4f} rad\n"
         f"Average Yaw Err 3s (6th pt):   {final_yaw_3s:.4f} rad\n"
         f"Average Decision Accuracy: {final_dec_acc*100:.2f}%\n"
+        f"Global Average Inference Time: {final_inf_time:.4f} s/step\n"
         f"Parking Success Rate:      {final_parking_success*100:.2f}%\n"
     )
     

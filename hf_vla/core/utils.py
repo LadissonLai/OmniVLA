@@ -135,3 +135,102 @@ def visualize_train_expvla(
         fig.savefig(save_path, bbox_inches='tight')
         plt.close(fig)
 
+def visualize_test_expvla(
+    save_path: str,
+    pred_actions: torch.Tensor,
+    gt_actions: torch.Tensor,
+    past_traj: torch.Tensor,
+    pred_decision,
+    gt_decision,
+    instruction: str,
+    image_front: torch.Tensor,
+    image_rear: torch.Tensor,
+    image_left: torch.Tensor,
+    image_right: torch.Tensor,
+):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
+    # helper func to convert normalized tensor back to viewable image
+    def to_img(tensor_img):
+        if tensor_img.shape[0] > 3:
+            tensor_img = tensor_img[:3, :, :]
+        img = tensor_img.detach().cpu().numpy().transpose(1, 2, 0)
+        img = np.clip((img - img.min()) / (img.max() - img.min() + 1e-8), 0, 1)
+        return img
+    
+    fig = plt.figure(figsize=(20, 10), dpi=80)
+    gs = fig.add_gridspec(2, 4)
+    
+    # 轨迹图 - 右半部分
+    ax_traj = fig.add_subplot(gs[0:2, 2:4])
+    
+    pred_x = pred_actions[:, 0].detach().cpu().to(torch.float32).numpy()
+    pred_y = pred_actions[:, 1].detach().cpu().to(torch.float32).numpy()
+    gt_x = gt_actions[:, 0].detach().cpu().to(torch.float32).numpy()
+    gt_y = gt_actions[:, 1].detach().cpu().to(torch.float32).numpy()
+    
+    if past_traj is not None and past_traj.shape[0] > 0:
+        hist_x = past_traj[:, 0].detach().cpu().to(torch.float32).numpy()
+        hist_y = past_traj[:, 1].detach().cpu().to(torch.float32).numpy()
+        ax_traj.plot(-hist_y, hist_x, marker='s', linewidth=2, markersize=6, color='green', label='History')
+
+    ax_traj.plot(-pred_y, pred_x, marker='o', linewidth=3, markersize=8, color='blue', label='Predicted')
+    ax_traj.plot(-gt_y, gt_x, marker='*', linewidth=3, markersize=8, color='red', label='Ground Truth')
+    
+    # Ego vehicle at origin
+    ax_traj.plot(0, 0, marker='^', markersize=10, color='orange', label='Ego (0,0)')
+    
+    ax_traj.set_title(f"{instruction}\nPred Decision: {pred_decision} | GT Decision: {gt_decision}")
+    # 采用半透明背景和自适应的最佳位置，防止图例遮挡关键轨迹
+    ax_traj.legend(loc='best', framealpha=0.8)
+    ax_traj.grid(True)
+    ax_traj.set_xlabel("-Y")
+    ax_traj.set_ylabel("X")
+    
+    # 动态调整坐标轴比例尺
+    # 获取所有的绘制坐标(图表的X轴对应汽车-Y，Y轴对应汽车X，包含自车原点)
+    all_plot_x = np.concatenate([-pred_y, -gt_y, [0.0]])
+    all_plot_y = np.concatenate([pred_x, gt_x, [0.0]])
+    
+    if past_traj is not None and past_traj.shape[0] > 0:
+        all_plot_x = np.concatenate([all_plot_x, -hist_y])
+        all_plot_y = np.concatenate([all_plot_y, hist_x])
+        
+    # 要求自车(0,0)在图片的中央，因此x和y必须各自以0为中心绝对对称
+    max_abs_x = max(np.max(np.abs(all_plot_x)), 0.5)
+    max_abs_y = max(np.max(np.abs(all_plot_y)), 0.5)
+    
+    # 统一x和y的最大数值作为两者共同的量程，保证缩放完全一致且自车居中
+    max_dist = max(max_abs_x, max_abs_y)
+    
+    # 刻度范围放大20%作为边距，确保所有轨迹清晰显示在画布内
+    ax_traj.set_xlim(-max_dist * 1.2, max_dist * 1.2)
+    ax_traj.set_ylim(-max_dist * 1.2, max_dist * 1.2)
+    
+    # 锁定物理世界真正的 1:1 比例，由于我们统一了量程范围，这回不再会被无理压缩了
+    ax_traj.set_aspect('equal')
+    
+    # 图像部分 - 左半部分
+    ax_front = fig.add_subplot(gs[0, 0])
+    ax_front.imshow(to_img(image_front))
+    ax_front.set_title("Front")
+    ax_front.axis("off")
+    
+    ax_rear = fig.add_subplot(gs[0, 1])
+    ax_rear.imshow(to_img(image_rear))
+    ax_rear.set_title("Rear")
+    ax_rear.axis("off")
+    
+    ax_left = fig.add_subplot(gs[1, 0])
+    ax_left.imshow(to_img(image_left))
+    ax_left.set_title("Left")
+    ax_left.axis("off")
+    
+    ax_right = fig.add_subplot(gs[1, 1])
+    ax_right.imshow(to_img(image_right))
+    ax_right.set_title("Right")
+    ax_right.axis("off")
+    
+    fig.savefig(save_path, bbox_inches='tight')
+    plt.close(fig)
+
