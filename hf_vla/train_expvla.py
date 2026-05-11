@@ -43,7 +43,7 @@ from core.utils import visualize_train_expvla
 class ExpVLAConfig:
     vla_path: str = "/public/home/lqq_202430131053/codes/OmniVLA/merged/openvla-7b-classic-merged"
     data_root: str = "/public/home/lqq_202430131053/codes/datasets/ParkingVLA"
-    run_root_dir: Path = Path("runs_expvla_2_decode_smart_history_OFT")
+    run_root_dir: Path = Path("runs_expvla_2_decode_smart_history_OFT2")
     
     # 学习率动态调节
     batch_size: int = 2
@@ -59,7 +59,7 @@ class ExpVLAConfig:
     
     # visulization
     visualize_traj: bool = True
-    visualize_dir: str = "vis_exp_smart_history_OFT_train"
+    visualize_dir: str = "vis_exp_smart_history_OFT2_train"
     
     # History Trajectory 配置
     history_mode: str = 'smart'   # fixed_count: 采取固定数量的历史轨迹，如果大于8个则等间隔采用，如果少于8个则取少于8个，如果为0，则添加1个全0轨迹；
@@ -75,16 +75,15 @@ class ExpVLAConfig:
     lora_dropout: float = 0.05
     
     # Logging
-    wandb_dir: str = "wandb_expvla_smart_history_OFT"
+    wandb_dir: str = "wandb_expvla_smart_history_OFT2"
     wandb_entity: str = "your-wandb-entity"
     wandb_project: str = "ExpVLA-Parking"
     wandb_log_freq: int = 64
     
-    
-
     # 损失权重
     W_ACT = 1.5
     W_SMOOTH = 0.5
+    W_FORWARD = 0.5
     W_DEC = 1.0
     W_OBJ = 0.5
 
@@ -284,13 +283,18 @@ def train_expvla(cfg: ExpVLAConfig):
                 l_action = mse_loss(pred_actions, gt_action)
                 l_obj = mse_loss(pred_actions[:, -1, 0:2], gt_action[:, -1, 0:2])
                 
-                # diff_pred = pred_actions[:, 1:, :] - pred_actions[:, :-1, :]
-                # diff_gt = gt_action[:, 1:, :] - gt_action[:, :-1, :]
-                # l_smooth = mse_loss(diff_pred, diff_gt)
-                l_decision = ce_loss(pred_decision_logits, gt_decision)
+                diff_pred = pred_actions[:, 1:, :] - pred_actions[:, :-1, :]
+                diff_gt = gt_action[:, 1:, :] - gt_action[:, :-1, :]
+                l_smooth = mse_loss(diff_pred, diff_gt)
                 
-                # total_loss = cfg.W_ACT * l_action + cfg.W_OBJ * l_obj + cfg.W_SMOOTH * l_smooth + cfg.W_DEC * l_decision
-                total_loss = cfg.W_ACT * l_action + cfg.W_OBJ * l_obj + cfg.W_DEC * l_decision
+                # 增加前朝向loss (Forward Loss)
+                # 自车方向向量固定为 (1, 0)，与位移向量做内积也就是计算 dx，如果 dx 为负（倒车）即为 loss
+                diff_pred_xy = pred_actions[:, 1:, 0:2] - pred_actions[:, :-1, 0:2]
+                inner_product = diff_pred_xy[:, :, 0] * 1.0 + diff_pred_xy[:, :, 1] * 0.0  # 实际上就是 dx
+                l_forward = torch.relu(-inner_product).mean()
+                
+                l_decision = ce_loss(pred_decision_logits, gt_decision)
+                total_loss = cfg.W_ACT * l_action + cfg.W_OBJ * l_obj + cfg.W_SMOOTH * l_smooth + cfg.W_DEC * l_decision + cfg.W_FORWARD * l_forward
                 
                 # Normalize loss to account for gradient accumulation
                 normalized_loss = total_loss / cfg.grad_accumulation_steps
@@ -331,6 +335,7 @@ def train_expvla(cfg: ExpVLAConfig):
                     "Loss": f"{total_loss.item():.4f}",
                     "Act": f"{l_action.item():.4f}",
                     "Dec": f"{l_decision.item():.4f}",
+                    "Forward": f"{l_forward.item():.4f}",
                     "Elapsed": elapsed_str,
                     "ETA": eta_str,
                 })
@@ -340,9 +345,10 @@ def train_expvla(cfg: ExpVLAConfig):
                     wandb.log({
                         "Loss/Total": sum(recent_losses)/len(recent_losses),
                         "Loss/Action": l_action.item(),
-                        # "Loss/Smooth": l_smooth.item(),
+                        "Loss/Smooth": l_smooth.item(),
                         "Loss/Obj (Endpoint)": l_obj.item(),
                         "Loss/Decision": l_decision.item(),
+                        "Loss/Forward": l_forward.item(),
                         "Learning Rate": scheduler.get_last_lr()[0],
                     }, step=global_step)
                     
