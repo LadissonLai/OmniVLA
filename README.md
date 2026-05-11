@@ -8,6 +8,8 @@
 
 <sup>1</sup> UC Berkeley (_Berkeley AI Research_),  <sup>2</sup> Toyota Motor North America, ,  <sup>3</sup> Princeton University
 
+IEEE International Conference on Robotics and Automation (ICRA) 2026
+
 ### Installation
 Please set up a conda environment (see instructions in [SETUP.md](SETUP.md)).
 
@@ -27,6 +29,19 @@ Please set up a conda environment (see instructions in [SETUP.md](SETUP.md)).
 4. Run OmniVLA to control the real robot. Modify "run_omnivla.py" to update the robot’s state (camera image, GPS signal) and adjust the goal information accordingly. Then, feed the generated velocity commands to your robot.
 
 5. To try the finetuned checkpoints with the CAST dataset, update the path and step number in "InferenceConfig" within "run_omnivla.py".
+
+### Inference: OmniVLA-edge
+1. Download our checkpoints and place them in our directory. 
+    ```
+    git clone https://huggingface.co/NHirose/omnivla-edge
+    ```
+2. Run OmniVLA-edge using a sample current image, goal images, GPS pose, and language prompt. You can view the generated trajectory in the output figure 1_ex_omnivla_edge.jpg.
+    ```
+    python inference/run_omnivla_edge.py
+    ```
+3. Change the goal modality: by default, our code generates actions based on the language prompt. To use a different modality, you can modify the settings around line 425. 
+    
+4. Run OmniVLA to control the real robot. Modify "run_omnivla_edge.py" to update the robot’s state (camera image, GPS signal) and adjust the goal information accordingly. Then, feed the generated velocity commands to your robot.
 
 ### Training
 We provide the training code along with a sample dataloader to help you quickly understand the required data loading structure. Since preparing the full training dataset is resource-intensive, we include this simplified code base for convenience.
