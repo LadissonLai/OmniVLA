@@ -24,9 +24,9 @@ from core.constants import FUTURE_ACTION_WAYPOINTS, ACTION_DIM
 @dataclass
 class TestConfig:
     vla_path: str = "/public/home/lqq_202430131053/codes/OmniVLA/merged/openvla-7b-classic-merged"
-    resume_dir: str = "/public/home/lqq_202430131053/codes/OmniVLA/runs_expvla_2_decode_smart_history_OFT/2026-05-08_10-57/step_59744_loss_0.0427_ckpt"
+    resume_dir: str = "/public/home/lqq_202430131053/codes/OmniVLA/runs_expvla_2_decode_smart_history_OFT2/2026-05-10_19-13/step_59744_loss_0.0748_ckpt"
     data_root: str = "/public/home/lqq_202430131053/codes/datasets/ParkingVLA_Val" # 测试集路径
-    output_file: str = "test_expvla_smart_history_16epoch-OFT.txt"
+    output_file: str = "test_expvla_smart_history_16epoch-OFT2.txt"
     
     # History Trajectory 配置，与训练一致
     history_mode: str = 'smart'
@@ -38,7 +38,7 @@ class TestConfig:
     
     # 可视化配置
     save_vis: bool = True
-    vis_dir: str = "vis_expvla_smart_history_result-OFT"
+    vis_dir: str = "vis_expvla_smart_history_result-OFT2"
 
 def calc_l2_distance(pred, gt):
     """计算单个时间点的 (x,y) L2 欧氏距离, 单位 m"""
