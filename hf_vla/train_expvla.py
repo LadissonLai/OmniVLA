@@ -17,7 +17,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoProcessor, AutoModelForVision2Seq
 
 # 导入上面两个脚本的数据与模型
-from core.exp_parking_dataset import ExpParkingDataset, BalancedBatchSampler, custom_collate_fn
+from core.exp_parking_dataset import ExpParkingDataset, custom_collate_fn
 from core.modeling_prismatic import ExpVLAForActionPrediction
 
 from transformers import (
@@ -43,10 +43,10 @@ from core.utils import visualize_train_expvla
 class ExpVLAConfig:
     vla_path: str = "/public/home/lqq_202430131053/codes/OmniVLA/merged/openvla-7b-classic-merged"
     data_root: str = "/public/home/lqq_202430131053/codes/datasets/ParkingVLA"
-    run_root_dir: Path = Path("runs_expvla_2_decode_smart_history_OFT2")
+    run_root_dir: Path = Path("runs_expvla_2decode_fullhistory")
     
     # 学习率动态调节
-    batch_size: int = 2
+    batch_size: int = 3
     learning_rate: float = 1e-4
     grad_accumulation_steps: int = 8
     epochs: int = 16
@@ -59,12 +59,13 @@ class ExpVLAConfig:
     
     # visulization
     visualize_traj: bool = True
-    visualize_dir: str = "vis_exp_smart_history_OFT2_train"
+    visualize_dir: str = "vis_expvla_2decode_fullhistory"
     
     # History Trajectory 配置
-    history_mode: str = 'smart'   # fixed_count: 采取固定数量的历史轨迹，如果大于8个则等间隔采用，如果少于8个则取少于8个，如果为0，则添加1个全0轨迹；
+    history_mode: str = 'full'   # fixed_count: 采取固定数量的历史轨迹，如果大于8个则等间隔采用，如果少于8个则取少于8个，如果为0，则添加1个全0轨迹；
                                         # distance_interval: 采取固定距离间隔的历史轨迹，每隔一定距离采样一个轨迹点，数量动态变化。
                                         # smart: 如果历史为0，则添加1个全0轨迹； 动态数量历史轨迹，直线稀疏采样，弯道密集采样。
+                                        # full: 全量历史轨迹，0..t-1 每一帧都送入 LLM，不做任何抽稀（序列较长，注意显存与 batch_size）。
     distance_interval: float = 0.5      # for fixed_distance mode, in meters
     turn_yaw_thresh: float = 5.0        # for smart mode, minimum yaw change in degrees to consider it a turn, in degrees
     turn_dense_interval: float = 0.1    # for smart mode, minimum distance interval in meters when a turn is detected
@@ -75,17 +76,21 @@ class ExpVLAConfig:
     lora_dropout: float = 0.05
     
     # Logging
-    wandb_dir: str = "wandb_expvla_smart_history_OFT2"
+    wandb_dir: str = "wandb_expvla_2decode_fullhistory"
     wandb_entity: str = "your-wandb-entity"
     wandb_project: str = "ExpVLA-Parking"
     wandb_log_freq: int = 64
     
     # 损失权重
-    W_ACT = 1.5
-    W_SMOOTH = 0.5
-    W_FORWARD = 0.5
-    W_DEC = 1.0
-    W_OBJ = 0.5
+    W_ACT:   float = 1.0
+    W_OBJ:   float = 0.5
+    W_YAW:   float = 0.5
+    W_XY1:   float = 0.5
+    W_XY2:   float = 0.3
+    W_YAW1:  float = 0.3
+    W_DEC:   float = 1.0
+
+    huber_beta: float = 1.0
 
 def wrap_ddp(module, device_id):
     from torch.nn.parallel import DistributedDataParallel as DDP
@@ -206,19 +211,17 @@ def train_expvla(cfg: ExpVLAConfig):
 
     # === 3. 数据加载 ===
     dataset = ExpParkingDataset(
-        cfg.data_root, 
-        tokenizer, 
-        processor.image_processor.apply_transform, 
+        cfg.data_root,
+        tokenizer,
+        processor.image_processor.apply_transform,
         future_steps=FUTURE_ACTION_WAYPOINTS,
         history_mode=cfg.history_mode,
         distance_interval=cfg.distance_interval,
         turn_yaw_thresh=cfg.turn_yaw_thresh,
         turn_dense_interval=cfg.turn_dense_interval
     )
-    # 这里的 cfg.batch_size 取其作为"负样本数量"的语义
-    sampler = BalancedBatchSampler(dataset.pos_indices, dataset.neg_indices, num_neg_per_batch=cfg.batch_size)
     dataloader = DataLoader(
-        dataset, batch_sampler=sampler, num_workers=cfg.num_workers,
+        dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
         collate_fn=lambda b: custom_collate_fn(b, pad_token_id)
     )
     
@@ -237,7 +240,7 @@ def train_expvla(cfg: ExpVLAConfig):
         gamma=0.1,
     )
     
-    mse_loss = nn.MSELoss()
+    huber_loss = nn.SmoothL1Loss(beta=cfg.huber_beta)
     ce_loss = nn.CrossEntropyLoss()
     
     
@@ -280,21 +283,53 @@ def train_expvla(cfg: ExpVLAConfig):
                 pred_actions = pred_actions_flat.view(-1, FUTURE_ACTION_WAYPOINTS, ACTION_DIM)
                 
                 # === Loss 计算 ===
-                l_action = mse_loss(pred_actions, gt_action)
-                l_obj = mse_loss(pred_actions[:, -1, 0:2], gt_action[:, -1, 0:2])
-                
-                diff_pred = pred_actions[:, 1:, :] - pred_actions[:, :-1, :]
-                diff_gt = gt_action[:, 1:, :] - gt_action[:, :-1, :]
-                l_smooth = mse_loss(diff_pred, diff_gt)
-                
-                # 增加前朝向loss (Forward Loss)
-                # 自车方向向量固定为 (1, 0)，与位移向量做内积也就是计算 dx，如果 dx 为负（倒车）即为 loss
-                diff_pred_xy = pred_actions[:, 1:, 0:2] - pred_actions[:, :-1, 0:2]
-                inner_product = diff_pred_xy[:, :, 0] * 1.0 + diff_pred_xy[:, :, 1] * 0.0  # 实际上就是 dx
-                l_forward = torch.relu(-inner_product).mean()
-                
+                pred_xy = pred_actions[:, :, 0:2]   # [B, 8, 2]
+                gt_xy   = gt_action[:, :, 0:2]
+
+                # XY 绝对位置损失
+                l_action = huber_loss(pred_xy, gt_xy)
+
+                # 终点 XY 损失
+                l_obj = huber_loss(pred_xy[:, -1, :], gt_xy[:, -1, :])
+
+                # 航向角绝对损失 (geodesic SO(2), 无 atan2)
+                cos_pred = pred_actions[:, :, 2]
+                sin_pred = pred_actions[:, :, 3]
+                cos_gt   = gt_action[:, :, 2]
+                sin_gt   = gt_action[:, :, 3]
+                norm_pred  = (cos_pred**2 + sin_pred**2 + 1e-8).sqrt()
+                cos_pred_n = cos_pred / norm_pred
+                sin_pred_n = sin_pred / norm_pred
+                cos_delta  = cos_pred_n * cos_gt + sin_pred_n * sin_gt
+                l_yaw      = (1.0 - cos_delta).mean()
+
+                # XY 一阶平滑损失
+                diff_pred_xy = pred_xy[:, 1:, :] - pred_xy[:, :-1, :]   # [B, 7, 2]
+                diff_gt_xy   = gt_xy[:, 1:, :]   - gt_xy[:, :-1, :]
+                l_xy_1st     = huber_loss(diff_pred_xy, diff_gt_xy)
+
+                # XY 二阶平滑损失
+                diff2_pred_xy = diff_pred_xy[:, 1:, :] - diff_pred_xy[:, :-1, :]  # [B, 6, 2]
+                diff2_gt_xy   = diff_gt_xy[:, 1:, :]   - diff_gt_xy[:, :-1, :]
+                l_xy_2nd      = huber_loss(diff2_pred_xy, diff2_gt_xy)
+
+                # Yaw 一阶平滑损失 (turning-rate geodesic, 无 atan2)
+                cos_turn_pred = cos_pred_n[:, 1:] * cos_pred_n[:, :-1] + sin_pred_n[:, 1:] * sin_pred_n[:, :-1]
+                sin_turn_pred = sin_pred_n[:, 1:] * cos_pred_n[:, :-1] - cos_pred_n[:, 1:] * sin_pred_n[:, :-1]
+                cos_turn_gt   = cos_gt[:, 1:] * cos_gt[:, :-1] + sin_gt[:, 1:] * sin_gt[:, :-1]
+                sin_turn_gt   = sin_gt[:, 1:] * cos_gt[:, :-1] - cos_gt[:, 1:] * sin_gt[:, :-1]
+                l_yaw_1st     = (1.0 - (cos_turn_pred * cos_turn_gt + sin_turn_pred * sin_turn_gt)).mean()
+
                 l_decision = ce_loss(pred_decision_logits, gt_decision)
-                total_loss = cfg.W_ACT * l_action + cfg.W_OBJ * l_obj + cfg.W_SMOOTH * l_smooth + cfg.W_DEC * l_decision + cfg.W_FORWARD * l_forward
+                total_loss = (
+                    cfg.W_ACT  * l_action
+                    + cfg.W_OBJ  * l_obj
+                    + cfg.W_YAW  * l_yaw
+                    + cfg.W_XY1  * l_xy_1st
+                    + cfg.W_XY2  * l_xy_2nd
+                    + cfg.W_YAW1 * l_yaw_1st
+                    + cfg.W_DEC  * l_decision
+                )
                 
                 # Normalize loss to account for gradient accumulation
                 normalized_loss = total_loss / cfg.grad_accumulation_steps
@@ -332,24 +367,28 @@ def train_expvla(cfg: ExpVLAConfig):
                 elapsed_str = str(timedelta(seconds=int(time.time() - train_start_time)))
 
                 progress.set_postfix({
-                    "Loss": f"{total_loss.item():.4f}",
-                    "Act": f"{l_action.item():.4f}",
-                    "Dec": f"{l_decision.item():.4f}",
-                    "Forward": f"{l_forward.item():.4f}",
+                    "Loss":    f"{total_loss.item():.4f}",
+                    "Act":     f"{l_action.item():.4f}",
+                    "Yaw":     f"{l_yaw.item():.4f}",
+                    "XY1":     f"{l_xy_1st.item():.4f}",
+                    "XY2":     f"{l_xy_2nd.item():.4f}",
+                    "Dec":     f"{l_decision.item():.4f}",
                     "Elapsed": elapsed_str,
-                    "ETA": eta_str,
+                    "ETA":     eta_str,
                 })
                 
                 # Logging & visualization
                 if global_step % cfg.wandb_log_freq == 0:
                     wandb.log({
-                        "Loss/Total": sum(recent_losses)/len(recent_losses),
-                        "Loss/Action": l_action.item(),
-                        "Loss/Smooth": l_smooth.item(),
-                        "Loss/Obj (Endpoint)": l_obj.item(),
+                        "Loss/Total":    sum(recent_losses) / len(recent_losses),
+                        "Loss/Action":   l_action.item(),
+                        "Loss/Obj":      l_obj.item(),
+                        "Loss/Yaw":      l_yaw.item(),
+                        "Loss/XY_1st":   l_xy_1st.item(),
+                        "Loss/XY_2nd":   l_xy_2nd.item(),
+                        "Loss/Yaw_1st":  l_yaw_1st.item(),
                         "Loss/Decision": l_decision.item(),
-                        "Loss/Forward": l_forward.item(),
-                        "Learning Rate": scheduler.get_last_lr()[0],
+                        "LR":            scheduler.get_last_lr()[0],
                     }, step=global_step)
                     
                     

@@ -16,7 +16,7 @@ import draccus
 # 从原有模块导入
 from core.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from core.configuration_prismatic import OpenVLAConfig
-from core.exp_parking_dataset import to_local_coords, custom_collate_fn, SingleTrajTestDataset
+from core.exp_parking_dataset import custom_collate_fn, ExpParkingDataset, find_traj_dirs
 from core.modeling_prismatic import ExpVLAForActionPrediction
 from core.utils import model_is_on_hf_hub, visualize_test_expvla
 from core.constants import FUTURE_ACTION_WAYPOINTS, ACTION_DIM
@@ -24,12 +24,13 @@ from core.constants import FUTURE_ACTION_WAYPOINTS, ACTION_DIM
 @dataclass
 class TestConfig:
     vla_path: str = "/public/home/lqq_202430131053/codes/OmniVLA/merged/openvla-7b-classic-merged"
-    resume_dir: str = "/public/home/lqq_202430131053/codes/OmniVLA/runs_expvla_2_decode_smart_history_OFT2/2026-05-10_19-13/step_59744_loss_0.0748_ckpt"
+    resume_dir: str = "/public/home/lqq_202430131053/codes/OmniVLA/runs_expvla_2decode_fullhistory/2026-06-04_12-41/step_41344_loss_0.0153_ckpt"
     data_root: str = "/public/home/lqq_202430131053/codes/datasets/ParkingVLA_Val" # 测试集路径
-    output_file: str = "test_expvla_smart_history_16epoch-OFT2.txt"
+    output_file: str = "test_expvla_fullhistory_16epoch.txt"
     
     # History Trajectory 配置，与训练一致
-    history_mode: str = 'smart'
+    # 可选: fixed_count / fixed_distance / smart / full（full=全量历史，不抽稀，需与训练一致）
+    history_mode: str = 'full'
     max_history: int = 8
     future_steps: int = 8
     distance_interval: float = 0.5
@@ -37,8 +38,8 @@ class TestConfig:
     turn_dense_interval: float = 0.1
     
     # 可视化配置
-    save_vis: bool = True
-    vis_dir: str = "vis_expvla_smart_history_result-OFT2"
+    save_vis: bool = False
+    vis_dir: str = "vis_expvla_fullhistory_result"
 
 def calc_l2_distance(pred, gt):
     """计算单个时间点的 (x,y) L2 欧氏距离, 单位 m"""
@@ -103,7 +104,7 @@ def evaluate_model(cfg: TestConfig):
     action_head.eval()
     decision_head.eval()
     
-    traj_dirs = [os.path.join(cfg.data_root, d) for d in os.listdir(cfg.data_root) if os.path.isdir(os.path.join(cfg.data_root, d))]
+    traj_dirs = find_traj_dirs(cfg.data_root)
     
     global_results = {
         "l2_1s": [],
@@ -113,7 +114,6 @@ def evaluate_model(cfg: TestConfig):
         "yaw_2s": [],
         "yaw_3s": [],
         "dec_acc": [],
-        "parking_success": [],
         "inf_time": []
     }
     
@@ -121,8 +121,8 @@ def evaluate_model(cfg: TestConfig):
         f.write("========== OmniVLA Evaluation Results ==========\n\n")
     
     for traj_dir in tqdm(traj_dirs, desc="Testing Trajectories"):
-        dataset = SingleTrajTestDataset(
-            traj_dir=traj_dir,
+        dataset = ExpParkingDataset(
+            data_root=traj_dir,
             tokenizer=tokenizer,
             image_transform=processor.image_processor.apply_transform,
             max_history=cfg.max_history,
@@ -143,8 +143,6 @@ def evaluate_model(cfg: TestConfig):
         traj_inf_time = []
         correct_decision = 0
         total_steps = len(dataset)
-        
-        last_step_success = False
 
         for step, batch in enumerate(dataloader):
             gt_action = batch['action_gt'].to(device).to(torch.bfloat16)
@@ -223,10 +221,6 @@ def evaluate_model(cfg: TestConfig):
                     batch['pixel_values_right'][0] if 'pixel_values_right' in batch else torch.zeros(3, 224, 224)
                 )
 
-            # Parking Success check (last step)
-            if step == total_steps - 1:
-                last_step_success = (pred_dec.item() == gt_decision[0].item())
-                
         # 统计本条轨迹结果
         avg_l2_1s = np.mean(traj_l2_1s)
         avg_l2_2s = np.mean(traj_l2_2s)
@@ -244,7 +238,6 @@ def evaluate_model(cfg: TestConfig):
         global_results['yaw_2s'].append(avg_yaw_2s)
         global_results['yaw_3s'].append(avg_yaw_3s)
         global_results['dec_acc'].append(dec_acc)
-        global_results['parking_success'].append(1 if last_step_success else 0)
         global_results['inf_time'].append(avg_inf_time)
         
         traj_name = os.path.basename(traj_dir)
@@ -253,8 +246,7 @@ def evaluate_model(cfg: TestConfig):
             f.write(f"  L2 Dist 1s: {avg_l2_1s:.4f} m | L2 Dist 2s: {avg_l2_2s:.4f} m | L2 Dist 3s: {avg_l2_3s:.4f} m\n")
             f.write(f"  Yaw Error 1s: {avg_yaw_1s:.4f} rad | Yaw Error 2s: {avg_yaw_2s:.4f} rad | Yaw Error 3s: {avg_yaw_3s:.4f} rad\n")
             f.write(f"  Decision Acc: {dec_acc*100:.2f}%\n")
-            f.write(f"  Avg Inference Time: {avg_inf_time:.4f} s/step\n")
-            f.write(f"  Parking Success: {'Yes' if last_step_success else 'No'}\n\n")
+            f.write(f"  Avg Inference Time: {avg_inf_time:.4f} s/step\n\n")
 
     # 全局统计
     final_l2_1s = np.mean(global_results['l2_1s'])
@@ -264,7 +256,6 @@ def evaluate_model(cfg: TestConfig):
     final_yaw_2s = np.mean(global_results['yaw_2s'])
     final_yaw_3s = np.mean(global_results['yaw_3s'])
     final_dec_acc = np.mean(global_results['dec_acc'])
-    final_parking_success = np.mean(global_results['parking_success'])
     final_inf_time = np.mean(global_results['inf_time'])
     
     summary = (
@@ -278,7 +269,6 @@ def evaluate_model(cfg: TestConfig):
         f"Average Yaw Err 3s (6th pt):   {final_yaw_3s:.4f} rad\n"
         f"Average Decision Accuracy: {final_dec_acc*100:.2f}%\n"
         f"Global Average Inference Time: {final_inf_time:.4f} s/step\n"
-        f"Parking Success Rate:      {final_parking_success*100:.2f}%\n"
     )
     
     print(summary)

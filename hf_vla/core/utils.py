@@ -234,3 +234,136 @@ def visualize_test_expvla(
     fig.savefig(save_path, bbox_inches='tight')
     plt.close(fig)
 
+
+def visualize_langpark(
+    save_path: str,
+    pred_actions: torch.Tensor,   # [future_steps, 4]
+    gt_actions: torch.Tensor,     # [future_steps, 4]
+    past_traj,                     # tensor [N, 4] or None
+    pred_decision: str,
+    gt_decision: str,
+    instruction: str,
+    image_front: torch.Tensor,
+    image_rear: torch.Tensor,
+    image_left: torch.Tensor,
+    image_right: torch.Tensor,
+    token_texts: list,             # decoded instruction tokens
+    gt_labels: list,               # per-token GT labels (0=done/1=active/2=upcoming/-100=ignore)
+    pred_labels: list,             # per-token predicted labels (0/1/2)
+):
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    def to_img(t):
+        if t.shape[0] > 3:
+            t = t[:3]
+        img = t.detach().cpu().numpy().transpose(1, 2, 0)
+        return np.clip((img - img.min()) / (img.max() - img.min() + 1e-8), 0, 1)
+
+    fig = plt.figure(figsize=(20, 14), dpi=80)
+    gs  = fig.add_gridspec(3, 4, height_ratios=[2, 2, 1.5], hspace=0.45, wspace=0.3)
+
+    # Camera images (top-left 2x2 block)
+    for spec, title, img in [
+        (gs[0, 0], "Front", image_front),
+        (gs[0, 1], "Rear",  image_rear),
+        (gs[1, 0], "Left",  image_left),
+        (gs[1, 1], "Right", image_right),
+    ]:
+        ax = fig.add_subplot(spec)
+        ax.imshow(to_img(img))
+        ax.set_title(title)
+        ax.axis("off")
+
+    # Trajectory plot (rows 0-1, cols 2-3)
+    ax_traj = fig.add_subplot(gs[0:2, 2:4])
+    px = pred_actions[:, 0].detach().cpu().float().numpy()
+    py = pred_actions[:, 1].detach().cpu().float().numpy()
+    gx = gt_actions[:, 0].detach().cpu().float().numpy()
+    gy = gt_actions[:, 1].detach().cpu().float().numpy()
+
+    all_plot_x = np.concatenate([-py, -gy, [0.]])
+    all_plot_y = np.concatenate([px,   gx, [0.]])
+
+    if past_traj is not None and past_traj.shape[0] > 1:
+        hx = past_traj[:, 0].detach().cpu().float().numpy()
+        hy = past_traj[:, 1].detach().cpu().float().numpy()
+        ax_traj.plot(-hy, hx, marker='s', lw=2, ms=6, color='green', label='History')
+        all_plot_x = np.concatenate([all_plot_x, -hy])
+        all_plot_y = np.concatenate([all_plot_y,  hx])
+
+    ax_traj.plot(-py, px, marker='o', lw=3, ms=8, color='blue', label='Predicted')
+    ax_traj.plot(-gy, gx, marker='*', lw=3, ms=8, color='red',  label='GT')
+    ax_traj.plot(0, 0, marker='^', ms=10, color='orange', label='Ego (0,0)')
+    ax_traj.set_title(f"{instruction}\nPred: {pred_decision} | GT: {gt_decision}")
+    ax_traj.legend(loc='best', framealpha=0.8)
+    ax_traj.grid(True)
+    ax_traj.set_xlabel("-Y")
+    ax_traj.set_ylabel("X")
+    d = max(np.max(np.abs(all_plot_x)), np.max(np.abs(all_plot_y)), 0.5)
+    ax_traj.set_xlim(-d * 1.2, d * 1.2)
+    ax_traj.set_ylim(-d * 1.2, d * 1.2)
+    ax_traj.set_aspect('equal')
+
+    # Language progress panels (row 2: GT left / Pred right)
+    ax_gt   = fig.add_subplot(gs[2, 0:2])
+    ax_pred = fig.add_subplot(gs[2, 2:4])
+
+    TOKEN_FONTSIZE = 14
+    TITLE_FONTSIZE = 11
+
+    # Ensure a renderer exists so token widths can be measured exactly.
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    def render_tokens(ax, texts, colors, title):
+        ax.axis('off')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_title(title, fontsize=TITLE_FONTSIZE, loc='left', pad=2)
+        inv    = ax.transAxes.inverted()
+        x, y   = 0.0, 0.90
+        line_h = 0.30
+        for tok, color in zip(texts, colors):
+            disp = tok.replace('▁', ' ').replace('Ġ', ' ')  # strip ▁ / Ġ prefix
+            if not disp:
+                continue
+            t = ax.text(x, y, disp, color=color, fontsize=TOKEN_FONTSIZE,
+                        transform=ax.transAxes, va='top', ha='left',
+                        fontfamily='monospace')
+            # Measure the rendered glyph width and convert px -> axes fraction.
+            bbox = t.get_window_extent(renderer=renderer)
+            w    = inv.transform((bbox.x1, 0))[0] - inv.transform((bbox.x0, 0))[0]
+            # Wrap to a new line if this token overflows the panel width.
+            if x > 0.0 and x + w > 0.98:
+                t.remove()
+                x  = 0.0
+                y -= line_h
+                if y < 0.0:
+                    break
+                t = ax.text(x, y, disp, color=color, fontsize=TOKEN_FONTSIZE,
+                            transform=ax.transAxes, va='top', ha='left',
+                            fontfamily='monospace')
+                bbox = t.get_window_extent(renderer=renderer)
+                w    = inv.transform((bbox.x1, 0))[0] - inv.transform((bbox.x0, 0))[0]
+            x += w
+
+    # GT panel: skip -100 positions; active(1) → red, others → gray
+    gt_t, gt_c = [], []
+    for tok, lbl in zip(token_texts, gt_labels):
+        if lbl == -100:
+            continue
+        gt_t.append(tok)
+        gt_c.append('red' if lbl == 1 else 'gray')
+    render_tokens(ax_gt, gt_t, gt_c,
+                  "GT Alignment  [red=active | gray=other]")
+
+    # Pred panel: all tokens, active(1) → blue, others → gray
+    pred_c = ['blue' if lbl == 1 else 'gray' for lbl in pred_labels]
+    render_tokens(ax_pred, token_texts, pred_c,
+                  "Pred Alignment  [blue=active | gray=other]")
+
+    fig.savefig(save_path, bbox_inches='tight')
+    plt.close(fig)
+

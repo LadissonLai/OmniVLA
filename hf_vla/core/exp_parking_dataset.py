@@ -19,6 +19,31 @@ def to_local_coords(target_x, target_y, target_yaw, curr_x, curr_y, curr_yaw):
     local_yaw = target_yaw - curr_yaw
     return np.array([local_x, local_y, np.cos(local_yaw), np.sin(local_yaw)])
 
+def find_traj_dirs(data_root, max_depth=2):
+    """从 data_root 向下查找所有轨迹目录（含 decision.txt），深度上限 max_depth。
+
+    兼容：
+      data_root/decision.txt                  (0 层)
+      data_root/<traj>/decision.txt           (1 层)
+      data_root/<group>/<traj>/decision.txt   (2 层)
+    一旦某目录被判定为轨迹目录，就不再向其内部递归。
+    """
+    traj_dirs = []
+
+    def _walk(cur_dir, depth):
+        if os.path.exists(os.path.join(cur_dir, "decision.txt")):
+            traj_dirs.append(cur_dir)
+            return
+        if depth >= max_depth:
+            return
+        for d in sorted(os.listdir(cur_dir)):
+            sub = os.path.join(cur_dir, d)
+            if os.path.isdir(sub):
+                _walk(sub, depth + 1)
+
+    _walk(data_root, 0)
+    return sorted(traj_dirs)
+
 class ExpParkingDataset(Dataset):
     def __init__(self, data_root, tokenizer, image_transform, max_history=8, future_steps=8,
                  history_mode='fixed_count', distance_interval=0.5, turn_yaw_thresh=5.0, turn_dense_interval=0.2):
@@ -31,49 +56,39 @@ class ExpParkingDataset(Dataset):
         self.distance_interval = distance_interval
         self.turn_yaw_thresh = turn_yaw_thresh
         self.turn_dense_interval = turn_dense_interval
-        
-        self.samples =[]
-        self.pos_indices = []
-        self.neg_indices =[]
+
+        self.samples = []
         self._build_dataset()
-        
+
     def _build_dataset(self):
-        traj_dirs =[os.path.join(self.data_root, d) for d in os.listdir(self.data_root) if os.path.isdir(os.path.join(self.data_root, d))]
-        idx = 0
+        traj_dirs = find_traj_dirs(self.data_root)
+
         for traj_dir in traj_dirs:
             with open(os.path.join(traj_dir, "decision.txt"), 'r') as f:
                 lines = f.readlines()
                 instruction = lines[0].strip()
                 true_decision_id = int(lines[1].strip())
-            
+
             odom_df = pd.read_csv(os.path.join(traj_dir, "odom.csv"))
             with open(os.path.join(traj_dir, "parking_slots.txt"), 'r') as f:
                 slots_data = [json.loads(line) for line in f.readlines()]
-                
+
             num_frames = len(odom_df)
             for t in range(num_frames):
                 curr_slots = slots_data[t]
-                
-                # 【决策阶段判定】：只有最后一帧（即 t == num_frames - 1）才算正样本，其他都算负样本
                 visible_ids = [slot['id'] for slot in curr_slots]
-                decision_id = true_decision_id if true_decision_id in visible_ids and t >= num_frames - 1 else 0
-                
-                sample = {
+                decision_id = true_decision_id if true_decision_id in visible_ids else 0
+
+                self.samples.append({
                     'traj_dir': traj_dir,
                     't': t,
                     'instruction': instruction,
                     'decision_id': decision_id,
                     'slots': curr_slots,
                     'odom': odom_df
-                }
-                self.samples.append(sample)
-                
-                if t >= num_frames - 1:
-                    self.pos_indices.append(idx)
-                else:
-                    self.neg_indices.append(idx)
-                idx += 1
-        print(f"Dataset built: {len(self.samples)} samples ({len(self.pos_indices)} Pos, {len(self.neg_indices)} Neg).")
+                })
+
+        print(f"Dataset built: {len(self.samples)} samples from {len(traj_dirs)} trajectories.")
 
     def __len__(self):
         return len(self.samples)
@@ -117,6 +132,10 @@ class ExpParkingDataset(Dataset):
                             history_traj.append(to_local_coords(hist_df.iloc[i]['x'], hist_df.iloc[i]['y'], hist_df.iloc[i]['yaw'], curr_state['x'], curr_state['y'], curr_state['yaw']))
                             last_idx = i
 
+            elif self.history_mode == 'full':
+                # 全量历史：0..t-1 每一帧都转局部坐标，不做任何抽稀
+                history_traj = [to_local_coords(row['x'], row['y'], row['yaw'], curr_state['x'], curr_state['y'], curr_state['yaw']) for _, row in hist_df.iterrows()]
+
             elif self.history_mode == 'smart':
                 states = []
                 for i in range(t):
@@ -126,7 +145,7 @@ class ExpParkingDataset(Dataset):
                     if yaw_diff > 180:
                         yaw_diff = 360 - yaw_diff
                     states.append('Turn' if yaw_diff > self.turn_yaw_thresh else 'Straight')
-                
+
                 last_idx = -1
                 for i in range(t):
                     row = hist_df.iloc[i]
@@ -189,158 +208,6 @@ class ExpParkingDataset(Dataset):
             'p_hist_ids': tokenize("History trajectory:"),
             'p_slots_ids': tokenize(f"Detected parking slot information: {slots_str}"),
             # 注：已移除决策占位提示和动作占位提示，将直接拼接全0 Embedding
-        }
-
-class SingleTrajTestDataset(Dataset):
-    """顺序读取单条轨迹的Dataset"""
-    def __init__(self, traj_dir, tokenizer, image_transform, max_history=8, future_steps=8,
-                 history_mode='fixed_count', distance_interval=0.5, turn_yaw_thresh=5.0, turn_dense_interval=0.1):
-        self.traj_dir = traj_dir
-        self.tokenizer = tokenizer
-        self.image_transform = image_transform
-        self.max_history = max_history
-        self.future_steps = future_steps
-        self.history_mode = history_mode
-        self.distance_interval = distance_interval
-        self.turn_yaw_thresh = turn_yaw_thresh                  # for smart mode
-        self.turn_dense_interval = turn_dense_interval          # for smart mode
-        
-        self.samples = []
-        self._build_dataset()
-        
-    def _build_dataset(self):
-        with open(os.path.join(self.traj_dir, "decision.txt"), 'r') as f:
-            lines = f.readlines()
-            instruction = lines[0].strip()
-            true_decision_id = int(lines[1].strip())
-        
-        odom_df = pd.read_csv(os.path.join(self.traj_dir, "odom.csv"))
-        with open(os.path.join(self.traj_dir, "parking_slots.txt"), 'r') as f:
-            slots_data = [json.loads(line) for line in f.readlines()]
-            
-        num_frames = len(odom_df)
-        for t in range(num_frames):
-            curr_slots = slots_data[t]
-            visible_ids = [slot['id'] for slot in curr_slots]
-            # 只有最后一帧GT decision为正确车位，其他为0
-            decision_id = true_decision_id if true_decision_id in visible_ids and t >= num_frames - 1 else 0
-            
-            sample = {
-                'traj_dir': self.traj_dir,
-                't': t,
-                'instruction': instruction,
-                'decision_id': decision_id,
-                'slots': curr_slots,
-                'odom': odom_df
-            }
-            self.samples.append(sample)
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        t = sample['t']
-        odom = sample['odom']
-        traj_dir = sample['traj_dir']
-        
-        images = {}
-        for view in ['front', 'rear', 'left', 'right']:
-            img_path = os.path.join(traj_dir, "images", view, f"{t+1:06d}.png")
-            img = Image.open(img_path).convert("RGB")
-            images[view] = self.image_transform(img)
-            
-        curr_state = odom.iloc[t]
-        hist_df = odom.iloc[0:t]
-        history_traj = []
-        
-        if t > 0:
-            if self.history_mode == 'fixed_count':
-                if t <= self.max_history:
-                    history_traj = [to_local_coords(row['x'], row['y'], row['yaw'], curr_state['x'], curr_state['y'], curr_state['yaw']) for _, row in hist_df.iterrows()]
-                else:
-                    indices = np.linspace(0, t - 1, self.max_history, dtype=int)
-                    history_traj = [to_local_coords(row['x'], row['y'], row['yaw'], curr_state['x'], curr_state['y'], curr_state['yaw']) for _, row in odom.iloc[indices].iterrows()]
-            
-            elif self.history_mode == 'fixed_distance':
-                last_idx = -1
-                for i in range(t):
-                    if i == 0 or i == t - 1:
-                        history_traj.append(to_local_coords(hist_df.iloc[i]['x'], hist_df.iloc[i]['y'], hist_df.iloc[i]['yaw'], curr_state['x'], curr_state['y'], curr_state['yaw']))
-                        last_idx = i
-                    else:
-                        dist = np.hypot(hist_df.iloc[i]['x'] - hist_df.iloc[last_idx]['x'], hist_df.iloc[i]['y'] - hist_df.iloc[last_idx]['y'])
-                        if dist >= self.distance_interval:
-                            history_traj.append(to_local_coords(hist_df.iloc[i]['x'], hist_df.iloc[i]['y'], hist_df.iloc[i]['yaw'], curr_state['x'], curr_state['y'], curr_state['yaw']))
-                            last_idx = i
-
-            elif self.history_mode == 'smart':
-                states = []
-                for i in range(t):
-                    start = max(0, i - 2)
-                    end = min(t - 1, i + 2)
-                    yaw_diff = abs(hist_df.iloc[end]['yaw'] - hist_df.iloc[start]['yaw']) % 360
-                    if yaw_diff > 180:
-                        yaw_diff = 360 - yaw_diff
-                    states.append('Turn' if yaw_diff > self.turn_yaw_thresh else 'Straight')
-                
-                last_idx = -1
-                for i in range(t):
-                    row = hist_df.iloc[i]
-                    pt = to_local_coords(row['x'], row['y'], row['yaw'], curr_state['x'], curr_state['y'], curr_state['yaw'])
-                    if i == 0 or i == t - 1:
-                        history_traj.append(pt)
-                        last_idx = i
-                    else:
-                        if states[i] == 'Straight':
-                            if states[i] != states[i-1] or (i + 1 < t and states[i] != states[i+1]):
-                                history_traj.append(pt)
-                                last_idx = i
-                        else:
-                            dist = np.hypot(row['x'] - hist_df.iloc[last_idx]['x'], row['y'] - hist_df.iloc[last_idx]['y'])
-                            if dist >= self.turn_dense_interval:
-                                history_traj.append(pt)
-                                last_idx = i
-
-        if len(history_traj) == 0:
-            history_tensor = torch.zeros((1, 4), dtype=torch.float32)
-        else:
-            history_tensor = torch.tensor(np.array(history_traj), dtype=torch.float32)
-        
-        future_df = odom.iloc[t+1 : t+1+self.future_steps]
-        future_traj = [to_local_coords(row['x'], row['y'], row['yaw'], curr_state['x'], curr_state['y'], curr_state['yaw']) for _, row in future_df.iterrows()]
-        
-        while len(future_traj) < self.future_steps:
-            if len(future_traj) > 0:
-                future_traj.append(future_traj[-1])
-            else:
-                future_traj.append(np.zeros(4))
-                
-        action_tensor = torch.tensor(np.array(future_traj), dtype=torch.float32)
-        
-        slots_str = "[]"
-        if len(sample['slots']) > 0:
-            slots_str = "Detected parking slots:[" + ",".join([f"(id={s['id']},x={s['x']:.2f},y={s['y']:.2f})" for s in sample['slots']]) + "]"
-            
-        decision_token_id = self.tokenizer.encode(str(sample['decision_id']), add_special_tokens=False)[-1]
-        
-        def tokenize(text):
-            return torch.tensor(self.tokenizer.encode(text, add_special_tokens=False), dtype=torch.long)
-            
-        return {
-            'pixel_values_front': images['front'], 'pixel_values_rear': images['rear'],
-            'pixel_values_left': images['left'], 'pixel_values_right': images['right'],
-            'history_traj': history_tensor, 'action_gt': action_tensor,
-            'decision_gt': torch.tensor(decision_token_id, dtype=torch.long),
-            'instruction': sample['instruction'],
-            'sys_prompt_ids': tokenize("Please predict the future trajectory and select the parking slot id based on the human instruction, the current four observation images, the history trajectory, and the detected parking slots."),
-            'instruct_ids': tokenize(f"Instruction: {sample['instruction']}"),
-            'p_front_ids': tokenize("Front view:"),
-            'p_rear_ids': tokenize("Rear view:"),
-            'p_left_ids': tokenize("Left view:"),
-            'p_right_ids': tokenize("Right view:"),
-            'p_hist_ids': tokenize("History trajectory:"),
-            'p_slots_ids': tokenize(f"Detected parking slot information: {slots_str}"),
         }
 
 class BalancedBatchSampler(Sampler):
@@ -442,8 +309,7 @@ class ClassicVLADataset(Dataset):
         self._build_dataset()
 
     def _build_dataset(self):
-        traj_dirs = [os.path.join(self.data_root, d) for d in os.listdir(self.data_root)
-                     if os.path.isdir(os.path.join(self.data_root, d))]
+        traj_dirs = find_traj_dirs(self.data_root)
         idx = 0
         for traj_dir in traj_dirs:
             with open(os.path.join(traj_dir, "decision.txt"), 'r') as f:
