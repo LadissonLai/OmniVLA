@@ -1,17 +1,21 @@
 import os
+import math
 import time
 import draccus
 import wandb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from accelerate import PartialState
 from peft import LoraConfig, get_peft_model
 from transformers import (
@@ -39,21 +43,30 @@ from core.constants import ACTION_DIM, FUTURE_ACTION_WAYPOINTS
 @dataclass
 class LangParkVLAConfig:
     # Paths
-    vla_path:     str  = "/public/home/lqq_202430131053/codes/OmniVLA/openvla-7b"
-    data_root:    str  = "/public/home/lqq_202430131053/codes/OmniVLA/datasets/ParkingVLA2"
-    run_root_dir: Path = Path("runs_langpark")
+    vla_path:     str  = "/root/autodl-tmp/codes/OmniVLA/openvla-7b"
+    data_root:    str  = "/root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA"
+    run_root_dir: Path = Path("runs/runs_langpark")
 
     # Training
-    batch_size:              int   = 3
-    learning_rate:           float = 1e-4
+    # batch_size is per-GPU. Recommended configs (H20-96GB, LoRA):
+    #   1 GPU : batch_size 8, grad_accum 2, lr 1e-4   (effective batch 16)
+    #   2 GPUs: batch_size 8, grad_accum 1, lr 1e-4   (effective batch 16)
+    #   4 GPUs: batch_size 8, grad_accum 1, lr 1.4e-4 (effective batch 32, sqrt-scaled LR)
+    #   8 GPUs: batch_size 8, grad_accum 1, lr 2e-4   (effective batch 64, sqrt-scaled LR)
+    batch_size:              int   = 4
+    learning_rate:           float = 1.4e-4
     grad_accumulation_steps: int   = 4
-    epochs:                  int   = 16
-    save_freq:               int   = 512
+    epochs:                  int   = 8
+    save_freq:               int   = 16    # in optimizer steps
     resume:                  bool  = False
     resume_dir:              str   = ""
-    num_workers:             int   = 2
-    lr_warmup_steps:         int   = 500
-    num_steps_before_decay:  int   = 2000
+    num_workers:             int   = 4     # per process
+
+    # LR schedule, as fractions of total optimizer steps:
+    # linear warm-up from 10% to 100% LR over the first warmup_ratio of training,
+    # constant afterwards, then x0.1 after decay_ratio of training.
+    warmup_ratio: float = 0.05
+    decay_ratio:  float = 0.85
 
     # Visualisation
     visualize_traj: bool = True
@@ -79,7 +92,7 @@ class LangParkVLAConfig:
     wandb_dir:      str = "wandb_langpark"
     wandb_entity:   str = "your-wandb-entity"
     wandb_project:  str = "LangPark-VLA"
-    wandb_log_freq: int = 64
+    wandb_log_freq: int = 16    # in optimizer steps
 
     # Loss weights
     W_ACT:   float = 1.0
@@ -100,9 +113,14 @@ class LangParkVLAConfig:
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def wrap_ddp(module: nn.Module, device_id: int) -> nn.Module:
-    from torch.nn.parallel import DistributedDataParallel as DDP
+def wrap_ddp(module: nn.Module, device_id: int, use_distributed: bool) -> nn.Module:
+    if not use_distributed:
+        return module
     return DDP(module, device_ids=[device_id], find_unused_parameters=True)
+
+
+def unwrap(module: nn.Module) -> nn.Module:
+    return module.module if isinstance(module, DDP) else module
 
 
 def save_training_checkpoint(
@@ -125,14 +143,14 @@ def save_training_checkpoint(
     os.makedirs(chkpt_dir, exist_ok=True)
 
     processor.save_pretrained(chkpt_dir)
-    vla.module.save_pretrained(chkpt_dir / "lora_adapter")
+    unwrap(vla).save_pretrained(chkpt_dir / "lora_adapter")
 
-    torch.save(past_traj_projector.module.state_dict(), chkpt_dir / "past_traj_projector.pt")
-    torch.save(full_hist_projector.module.state_dict(), chkpt_dir / "full_hist_projector.pt")
-    torch.save(action_head.module.state_dict(),         chkpt_dir / "action_head.pt")
-    torch.save(decision_head.module.state_dict(),       chkpt_dir / "decision_head.pt")
-    torch.save(mem_module.module.state_dict(),          chkpt_dir / "mem_module.pt")
-    torch.save(align_head.module.state_dict(),          chkpt_dir / "align_head.pt")
+    torch.save(unwrap(past_traj_projector).state_dict(), chkpt_dir / "past_traj_projector.pt")
+    torch.save(unwrap(full_hist_projector).state_dict(), chkpt_dir / "full_hist_projector.pt")
+    torch.save(unwrap(action_head).state_dict(),         chkpt_dir / "action_head.pt")
+    torch.save(unwrap(decision_head).state_dict(),       chkpt_dir / "decision_head.pt")
+    torch.save(unwrap(mem_module).state_dict(),          chkpt_dir / "mem_module.pt")
+    torch.save(unwrap(align_head).state_dict(),          chkpt_dir / "align_head.pt")
 
     print(f"Checkpoint saved at {chkpt_dir}")
 
@@ -144,6 +162,7 @@ def save_training_checkpoint(
 @draccus.wrap()
 def train_langpark(cfg: LangParkVLAConfig):
     distributed_state = PartialState()
+    use_distributed   = distributed_state.use_distributed
     device_id         = distributed_state.local_process_index
     torch.cuda.set_device(device_id)
 
@@ -200,12 +219,12 @@ def train_langpark(cfg: LangParkVLAConfig):
             )
             vla = get_peft_model(vla, lora_config)
 
-    vla = wrap_ddp(vla, device_id)
+    vla = wrap_ddp(vla, device_id, use_distributed)
 
     # ── 2. External modules ───────────────────────────────────────────────────
 
-    llm_dim    = vla.module.config.text_config.hidden_size
-    vocab_size = vla.module.config.text_config.vocab_size
+    llm_dim    = unwrap(vla).config.text_config.hidden_size
+    vocab_size = unwrap(vla).config.text_config.vocab_size
 
     def make_projector():
         return nn.Sequential(
@@ -252,13 +271,16 @@ def train_langpark(cfg: LangParkVLAConfig):
         if distributed_state.is_main_process:
             print(f"Resumed all external modules from {cfg.resume_dir}")
 
-    # Wrap all external modules with DDP
-    past_traj_projector = wrap_ddp(past_traj_projector, device_id)
-    full_hist_projector = wrap_ddp(full_hist_projector, device_id)
-    action_head         = wrap_ddp(action_head,         device_id)
-    decision_head       = wrap_ddp(decision_head,       device_id)
-    mem_module          = wrap_ddp(mem_module,          device_id)
-    align_head          = wrap_ddp(align_head,          device_id)
+    # Wrap all external modules with DDP (no-op on single GPU)
+    past_traj_projector = wrap_ddp(past_traj_projector, device_id, use_distributed)
+    full_hist_projector = wrap_ddp(full_hist_projector, device_id, use_distributed)
+    action_head         = wrap_ddp(action_head,         device_id, use_distributed)
+    decision_head       = wrap_ddp(decision_head,       device_id, use_distributed)
+    mem_module          = wrap_ddp(mem_module,          device_id, use_distributed)
+    align_head          = wrap_ddp(align_head,          device_id, use_distributed)
+
+    all_modules = (vla, past_traj_projector, full_hist_projector,
+                   action_head, decision_head, mem_module, align_head)
 
     # ── 3. Dataset and DataLoader ─────────────────────────────────────────────
 
@@ -272,11 +294,15 @@ def train_langpark(cfg: LangParkVLAConfig):
         turn_dense_interval=cfg.turn_dense_interval,
     )
 
+    sampler = DistributedSampler(dataset, shuffle=True) if use_distributed else None
+
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=cfg.num_workers,
+        pin_memory=True,
         collate_fn=lambda b: langpark_collate_fn(b, pad_token_id),
     )
 
@@ -291,9 +317,25 @@ def train_langpark(cfg: LangParkVLAConfig):
         + list(mem_module.parameters())
         + list(align_head.parameters())
     )
-    optimizer   = AdamW(trainable_params, lr=cfg.learning_rate)
-    original_lr = optimizer.param_groups[0]["lr"]
-    scheduler   = MultiStepLR(optimizer, milestones=[cfg.num_steps_before_decay], gamma=0.1)
+    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+
+    # Warm-up / decay milestones derived from total optimizer steps, so the
+    # schedule shape stays the same regardless of GPU count / batch size.
+    steps_per_epoch   = math.ceil(len(dataloader) / cfg.grad_accumulation_steps)
+    total_optim_steps = cfg.epochs * steps_per_epoch
+    warmup_steps      = max(1, int(total_optim_steps * cfg.warmup_ratio))
+    decay_step        = int(total_optim_steps * cfg.decay_ratio)
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return 0.1 + 0.9 * (step + 1) / warmup_steps
+        return 0.1 if step >= decay_step else 1.0
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
+
+    if distributed_state.is_main_process:
+        print(f"LR schedule: {total_optim_steps} optimizer steps total, "
+              f"warmup {warmup_steps}, decay x0.1 at {decay_step}")
 
     huber_loss = nn.SmoothL1Loss(beta=cfg.huber_beta)
     ce_loss    = nn.CrossEntropyLoss()
@@ -302,12 +344,12 @@ def train_langpark(cfg: LangParkVLAConfig):
 
     # ── 5. Training setup ─────────────────────────────────────────────────────
 
-    for module in (vla, past_traj_projector, full_hist_projector,
-                   action_head, decision_head, mem_module, align_head):
+    for module in all_modules:
         module.train()
     optimizer.zero_grad()
 
-    global_step      = 0
+    global_step      = 0   # micro-steps (per-rank batches)
+    optim_step       = 0   # optimizer updates
     total_steps      = cfg.epochs * len(dataloader)
     train_start_time = time.time()
     step_times       = deque(maxlen=50)
@@ -324,124 +366,131 @@ def train_langpark(cfg: LangParkVLAConfig):
     # ── 6. Training loop ──────────────────────────────────────────────────────
 
     for epoch in range(cfg.epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
         progress = tqdm.tqdm(dataloader, desc=f"Epoch {epoch + 1}/{cfg.epochs}", leave=False)
 
         for batch_idx, batch in enumerate(progress):
             step_start = time.time()
 
+            is_update_step = (
+                (batch_idx + 1) % cfg.grad_accumulation_steps == 0
+                or (batch_idx + 1) == len(dataloader)
+            )
+
             gt_action   = batch['action_gt'].to(device_id).to(torch.bfloat16)   # [B, 8, 4]
             gt_decision = batch['decision_gt'].to(device_id)                     # [B]
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                # Forward
-                outputs = vla(
-                    batch,
-                    past_traj_projector=past_traj_projector,
-                    full_hist_projector=full_hist_projector,
-                    mem_module=mem_module,
-                )
-                last_hidden = outputs.hidden_states[-1]   # [B, Seq, D]
+            # Skip inter-GPU gradient sync on accumulation-only micro-steps
+            with ExitStack() as sync_ctx:
+                if use_distributed and not is_update_step:
+                    for m in all_modules:
+                        sync_ctx.enter_context(m.no_sync())
 
-                # ── dec / act hidden states (same indexing as ExpVLA) ──────────
-                # Tail layout: ... MEM(16) | dec(1) | act(32) | EOS(1)
-                # Hidden at pos -(NUM_ACT+3) = MEM[15]: predicts dec (autoregressive shift)
-                # Hidden at pos -(NUM_ACT+2):-2 = dec..act[30]: predicts act[0]..act[31]
-                decision_hidden = last_hidden[:, -(NUM_ACT + 3), :]
-                actions_hidden  = last_hidden[:, -(NUM_ACT + 2):-2, :]
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    # Forward
+                    outputs = vla(
+                        batch,
+                        past_traj_projector=past_traj_projector,
+                        full_hist_projector=full_hist_projector,
+                        mem_module=mem_module,
+                    )
+                    last_hidden = outputs.hidden_states[-1]   # [B, Seq, D]
 
-                # ── MEM hidden states ──────────────────────────────────────────
-                # MEM[0..15] at positions -(NUM_ACT+2+16) to -(NUM_ACT+2) exclusive
-                mem_hidden = last_hidden[:, -(NUM_ACT + 2 + NUM_MEM):-(NUM_ACT + 2), :]  # [B, 16, D]
+                    # ── dec / act hidden states (same indexing as ExpVLA) ──────────
+                    # Tail layout: ... MEM(16) | dec(1) | act(32) | EOS(1)
+                    # Hidden at pos -(NUM_ACT+3) = MEM[15]: predicts dec (autoregressive shift)
+                    # Hidden at pos -(NUM_ACT+2):-2 = dec..act[30]: predicts act[0]..act[31]
+                    decision_hidden = last_hidden[:, -(NUM_ACT + 3), :]
+                    actions_hidden  = last_hidden[:, -(NUM_ACT + 2):-2, :]
 
-                # ── Predictions ────────────────────────────────────────────────
-                pred_decision_logits = decision_head(decision_hidden)             # [B, vocab]
-                pred_actions_flat    = action_head(actions_hidden).squeeze(-1)    # [B, 32]
-                pred_actions         = pred_actions_flat.view(-1, FUTURE_ACTION_WAYPOINTS, ACTION_DIM)  # [B,8,4]
+                    # ── MEM hidden states ──────────────────────────────────────────
+                    # MEM[0..15] at positions -(NUM_ACT+2+16) to -(NUM_ACT+2) exclusive
+                    mem_hidden = last_hidden[:, -(NUM_ACT + 2 + NUM_MEM):-(NUM_ACT + 2), :]  # [B, 16, D]
 
-                # ── Loss computation ───────────────────────────────────────────
-                pred_xy = pred_actions[:, :, 0:2]              # [B,8,2]
-                gt_xy   = gt_action[:, :, 0:2]
+                    # ── Predictions ────────────────────────────────────────────────
+                    pred_decision_logits = decision_head(decision_hidden)             # [B, vocab]
+                    pred_actions_flat    = action_head(actions_hidden).squeeze(-1)    # [B, 32]
+                    pred_actions         = pred_actions_flat.view(-1, FUTURE_ACTION_WAYPOINTS, ACTION_DIM)  # [B,8,4]
 
-                # Position regression (xy ONLY)
-                l_action = huber_loss(pred_xy, gt_xy)
+                    # ── Loss computation ───────────────────────────────────────────
+                    pred_xy = pred_actions[:, :, 0:2]              # [B,8,2]
+                    gt_xy   = gt_action[:, :, 0:2]
 
-                # Endpoint emphasis (xy only)
-                l_obj = huber_loss(pred_xy[:, -1, :], gt_xy[:, -1, :])
+                    # Position regression (xy ONLY)
+                    l_action = huber_loss(pred_xy, gt_xy)
 
-                # Yaw absolute error: geodesic loss on SO(2), no atan2
-                cos_pred  = pred_actions[:, :, 2]
-                sin_pred  = pred_actions[:, :, 3]
-                cos_gt    = gt_action[:, :, 2]
-                sin_gt    = gt_action[:, :, 3]
-                # Normalize predictions onto unit circle to avoid atan2 gradient explosion
-                norm_pred  = (cos_pred**2 + sin_pred**2 + 1e-8).sqrt()
-                cos_pred_n = cos_pred / norm_pred
-                sin_pred_n = sin_pred / norm_pred
-                cos_delta  = cos_pred_n * cos_gt + sin_pred_n * sin_gt   # cos(θ_pred - θ_gt)
-                l_yaw      = (1.0 - cos_delta).mean()
+                    # Endpoint emphasis (xy only)
+                    l_obj = huber_loss(pred_xy[:, -1, :], gt_xy[:, -1, :])
 
-                # XY 1st-order smoothness: consecutive displacement matches GT
-                diff_pred_xy = pred_xy[:, 1:, :] - pred_xy[:, :-1, :]  # [B,7,2]
-                diff_gt_xy   = gt_xy[:, 1:, :]   - gt_xy[:, :-1, :]
-                l_xy_1st     = huber_loss(diff_pred_xy, diff_gt_xy)
+                    # Yaw absolute error: geodesic loss on SO(2), no atan2
+                    cos_pred  = pred_actions[:, :, 2]
+                    sin_pred  = pred_actions[:, :, 3]
+                    cos_gt    = gt_action[:, :, 2]
+                    sin_gt    = gt_action[:, :, 3]
+                    # Normalize predictions onto unit circle to avoid atan2 gradient explosion
+                    norm_pred  = (cos_pred**2 + sin_pred**2 + 1e-8).sqrt()
+                    cos_pred_n = cos_pred / norm_pred
+                    sin_pred_n = sin_pred / norm_pred
+                    cos_delta  = cos_pred_n * cos_gt + sin_pred_n * sin_gt   # cos(θ_pred - θ_gt)
+                    l_yaw      = (1.0 - cos_delta).mean()
 
-                # XY 2nd-order smoothness: consecutive acceleration matches GT
-                diff2_pred_xy = diff_pred_xy[:, 1:, :] - diff_pred_xy[:, :-1, :]  # [B,6,2]
-                diff2_gt_xy   = diff_gt_xy[:, 1:, :]   - diff_gt_xy[:, :-1, :]
-                l_xy_2nd      = huber_loss(diff2_pred_xy, diff2_gt_xy)
+                    # XY 1st-order smoothness: consecutive displacement matches GT
+                    diff_pred_xy = pred_xy[:, 1:, :] - pred_xy[:, :-1, :]  # [B,7,2]
+                    diff_gt_xy   = gt_xy[:, 1:, :]   - gt_xy[:, :-1, :]
+                    l_xy_1st     = huber_loss(diff_pred_xy, diff_gt_xy)
 
-                # Yaw 1st-order smoothness: turning-rate geodesic loss, no atan2
-                cos_turn_pred = cos_pred_n[:, 1:] * cos_pred_n[:, :-1] + sin_pred_n[:, 1:] * sin_pred_n[:, :-1]  # [B,7] θ_pre cos(θ_t+1 - θ_t)
-                sin_turn_pred = sin_pred_n[:, 1:] * cos_pred_n[:, :-1] - cos_pred_n[:, 1:] * sin_pred_n[:, :-1]  # sin(θ_t+1 - θ_t)
-                cos_turn_gt   = cos_gt[:, 1:] * cos_gt[:, :-1] + sin_gt[:, 1:] * sin_gt[:, :-1]
-                sin_turn_gt   = sin_gt[:, 1:] * cos_gt[:, :-1] - cos_gt[:, 1:] * sin_gt[:, :-1]
-                l_yaw_1st     = (1.0 - (cos_turn_pred * cos_turn_gt + sin_turn_pred * sin_turn_gt)).mean() # cos(delta_theta_{pre} - delta_theta_{gt})
+                    # XY 2nd-order smoothness: consecutive acceleration matches GT
+                    diff2_pred_xy = diff_pred_xy[:, 1:, :] - diff_pred_xy[:, :-1, :]  # [B,6,2]
+                    diff2_gt_xy   = diff_gt_xy[:, 1:, :]   - diff_gt_xy[:, :-1, :]
+                    l_xy_2nd      = huber_loss(diff2_pred_xy, diff2_gt_xy)
 
-                # Decision (slot id) classification
-                l_decision = ce_loss(pred_decision_logits, gt_decision)
+                    # Yaw 1st-order smoothness: turning-rate geodesic loss, no atan2
+                    cos_turn_pred = cos_pred_n[:, 1:] * cos_pred_n[:, :-1] + sin_pred_n[:, 1:] * sin_pred_n[:, :-1]  # [B,7] θ_pre cos(θ_t+1 - θ_t)
+                    sin_turn_pred = sin_pred_n[:, 1:] * cos_pred_n[:, :-1] - cos_pred_n[:, 1:] * sin_pred_n[:, :-1]  # sin(θ_t+1 - θ_t)
+                    cos_turn_gt   = cos_gt[:, 1:] * cos_gt[:, :-1] + sin_gt[:, 1:] * sin_gt[:, :-1]
+                    sin_turn_gt   = sin_gt[:, 1:] * cos_gt[:, :-1] - cos_gt[:, 1:] * sin_gt[:, :-1]
+                    l_yaw_1st     = (1.0 - (cos_turn_pred * cos_turn_gt + sin_turn_pred * sin_turn_gt)).mean() # cos(delta_theta_{pre} - delta_theta_{gt})
 
-                # Instruction alignment
-                align_logits = align_head(
-                    outputs.instruct_emb, mem_hidden, outputs.instruct_mask
-                )   # [B, L_inst, 3]
-                align_labels = batch['align_label'].to(device_id)   # [B, L_inst], -100=ignore
-                l_align = F.cross_entropy(
-                    align_logits.reshape(-1, 3),
-                    align_labels.reshape(-1),
-                    ignore_index=-100,
-                )
+                    # Decision (slot id) classification
+                    l_decision = ce_loss(pred_decision_logits, gt_decision)
 
-                # Weighted total
-                total_loss = (
-                    cfg.W_ACT   * l_action
-                    + cfg.W_OBJ   * l_obj
-                    + cfg.W_YAW   * l_yaw
-                    + cfg.W_XY1   * l_xy_1st
-                    + cfg.W_XY2   * l_xy_2nd
-                    + cfg.W_YAW1  * l_yaw_1st
-                    + cfg.W_DEC   * l_decision
-                    + cfg.W_ALIGN * l_align
-                )
+                    # Instruction alignment
+                    align_logits = align_head(
+                        outputs.instruct_emb, mem_hidden, outputs.instruct_mask
+                    )   # [B, L_inst, 3]
+                    align_labels = batch['align_label'].to(device_id)   # [B, L_inst], -100=ignore
+                    l_align = F.cross_entropy(
+                        align_logits.reshape(-1, 3),
+                        align_labels.reshape(-1),
+                        ignore_index=-100,
+                    )
 
-                normalized_loss = total_loss / cfg.grad_accumulation_steps
+                    # Weighted total
+                    total_loss = (
+                        cfg.W_ACT   * l_action
+                        + cfg.W_OBJ   * l_obj
+                        + cfg.W_YAW   * l_yaw
+                        + cfg.W_XY1   * l_xy_1st
+                        + cfg.W_XY2   * l_xy_2nd
+                        + cfg.W_YAW1  * l_yaw_1st
+                        + cfg.W_DEC   * l_decision
+                        + cfg.W_ALIGN * l_align
+                    )
 
-            normalized_loss.backward()
+                    normalized_loss = total_loss / cfg.grad_accumulation_steps
+
+                normalized_loss.backward()
+
             recent_losses.append(total_loss.item())
 
             # Gradient accumulation step
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
-                gradient_step_idx = global_step // cfg.grad_accumulation_steps
-
-                # Linear LR warm-up from 10 % to 100 %
-                if cfg.lr_warmup_steps > 0:
-                    lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)
-                    current_lr  = original_lr * (0.1 + 0.9 * lr_progress)
-                    for pg in optimizer.param_groups:
-                        pg["lr"] = current_lr
-
+            if is_update_step:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                optim_step += 1
 
             global_step += 1
 
@@ -465,7 +514,7 @@ def train_langpark(cfg: LangParkVLAConfig):
                     "ETA":     eta_str,
                 })
 
-                if global_step % cfg.wandb_log_freq == 0:
+                if is_update_step and optim_step % cfg.wandb_log_freq == 0:
                     wandb.log(
                         {
                             "Loss/Total":    sum(recent_losses) / len(recent_losses),
@@ -479,16 +528,16 @@ def train_langpark(cfg: LangParkVLAConfig):
                             "Loss/Align":    l_align.item(),
                             "LR":            scheduler.get_last_lr()[0],
                         },
-                        step=global_step,
+                        step=optim_step,
                     )
 
             # ── Checkpoint ────────────────────────────────────────────────
-            if global_step > 0 and global_step % cfg.save_freq == 0:
+            if is_update_step and optim_step % cfg.save_freq == 0:
                 if distributed_state.is_main_process:
                     save_training_checkpoint(
                         cfg=cfg,
                         run_dir=save_ckpt_dir,
-                        log_step=global_step,
+                        log_step=optim_step,
                         vla=vla,
                         processor=processor,
                         past_traj_projector=past_traj_projector,
@@ -521,7 +570,7 @@ def train_langpark(cfg: LangParkVLAConfig):
                         images_left=batch['pixel_values_left'],
                         images_right=batch['pixel_values_right'],
                         epoch=epoch,
-                        step=global_step,
+                        step=optim_step,
                     )
 
     # ── Final checkpoint ──────────────────────────────────────────────────────
@@ -529,7 +578,7 @@ def train_langpark(cfg: LangParkVLAConfig):
         save_training_checkpoint(
             cfg=cfg,
             run_dir=save_ckpt_dir,
-            log_step=global_step,
+            log_step=optim_step,
             vla=vla,
             processor=processor,
             past_traj_projector=past_traj_projector,
@@ -540,7 +589,9 @@ def train_langpark(cfg: LangParkVLAConfig):
             align_head=align_head,
             loss=total_loss.item(),
         )
-        distributed_state.wait_for_everyone()
+    distributed_state.wait_for_everyone()
+
+    if distributed_state.is_main_process:
         print("Training completed!")
         wandb.finish()
 
