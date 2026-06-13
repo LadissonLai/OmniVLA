@@ -1,3 +1,22 @@
+"""
+train_langpark_ablation_align_only.py
+
+Ablation #3: KEEP InstructionAlignmentHead, REMOVE MemoryEnhancementModule.
+
+The 16 memory slots are kept in the sequence but filled with ZERO placeholder
+embeddings (no MEM cross-attention module, no full-history projection). The
+alignment head still attends to the LLM hidden states at those 16 slot positions
+and is trained with the instruction-alignment auxiliary loss. This isolates the
+contribution of the MEM module's structured computation from the alignment task.
+
+Uses the dedicated `LangParkAlignOnlyVLAForActionPrediction` model so the shared
+`modeling_langpark.py` (full model / mem_only) is untouched.
+
+Sequence layout (zero memory slots):
+  BOS | sys_prompt | instruct | p_front | front | p_rear | rear | p_left | left |
+  p_right | right | p_hist | hist | p_slots | MEM_ZERO(16) | dec(1) | act(32) | EOS(1)
+"""
+
 import os
 import math
 import time
@@ -7,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
@@ -28,8 +47,8 @@ from huggingface_hub import snapshot_download
 import tqdm
 
 from core.langpark_dataset import LangParkDataset, langpark_collate_fn
-from core.langpark_modules import MemoryEnhancementModule, InstructionAlignmentHead
-from core.modeling_langpark import LangParkVLAForActionPrediction
+from core.langpark_modules import InstructionAlignmentHead
+from core.modeling_langpark_align_only import LangParkAlignOnlyVLAForActionPrediction
 from core.configuration_prismatic import OpenVLAConfig
 from core.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from core.utils import model_is_on_hf_hub, visualize_train_expvla
@@ -41,11 +60,11 @@ from core.constants import ACTION_DIM, FUTURE_ACTION_WAYPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
-class LangParkVLAConfig:
+class LangParkAlignOnlyConfig:
     # Paths
     vla_path:     str  = "/root/autodl-tmp/codes/OmniVLA/openvla-7b"
     data_root:    str  = "/root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA"
-    run_root_dir: Path = Path("runs/runs_langpark")
+    run_root_dir: Path = Path("runs/runs_langpark_ablation_align_only")
 
     # Training
     # batch_size is per-GPU. Recommended configs (H20-96GB, LoRA):
@@ -70,7 +89,7 @@ class LangParkVLAConfig:
 
     # Visualisation
     visualize_traj: bool = True
-    visualize_dir:  str  = "vis/vis_langpark_train"
+    visualize_dir:  str  = "vis/vis_langpark_ablation_align_only_train"
 
     # History config (must match dataset)
     history_mode:        str   = 'smart'
@@ -83,9 +102,8 @@ class LangParkVLAConfig:
     lora_rank:    int   = 32
     lora_dropout: float = 0.05
 
-    # IAM module
-    num_mem_tokens: int = 16
-    mem_num_heads:  int = 8
+    # Alignment head (kept). MEM module removed → 16 slots are zero placeholders.
+    num_mem_tokens:  int = 16
     align_num_heads: int = 8
 
     # Logging
@@ -130,10 +148,8 @@ def save_training_checkpoint(
     vla,
     processor,
     past_traj_projector,
-    full_hist_projector,
     action_head,
     decision_head,
-    mem_module,
     align_head,
     loss: float = None,
 ):
@@ -146,10 +162,8 @@ def save_training_checkpoint(
     unwrap(vla).save_pretrained(chkpt_dir / "lora_adapter")
 
     torch.save(unwrap(past_traj_projector).state_dict(), chkpt_dir / "past_traj_projector.pt")
-    torch.save(unwrap(full_hist_projector).state_dict(), chkpt_dir / "full_hist_projector.pt")
     torch.save(unwrap(action_head).state_dict(),         chkpt_dir / "action_head.pt")
     torch.save(unwrap(decision_head).state_dict(),       chkpt_dir / "decision_head.pt")
-    torch.save(unwrap(mem_module).state_dict(),          chkpt_dir / "mem_module.pt")
     torch.save(unwrap(align_head).state_dict(),          chkpt_dir / "align_head.pt")
 
     print(f"Checkpoint saved at {chkpt_dir}")
@@ -160,7 +174,7 @@ def save_training_checkpoint(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @draccus.wrap()
-def train_langpark(cfg: LangParkVLAConfig):
+def train_langpark_ablation_align_only(cfg: LangParkAlignOnlyConfig):
     distributed_state = PartialState()
     use_distributed   = distributed_state.use_distributed
     device_id         = distributed_state.local_process_index
@@ -171,7 +185,7 @@ def train_langpark(cfg: LangParkVLAConfig):
         wandb.init(
             entity=cfg.wandb_entity,
             project=cfg.wandb_project,
-            name="langpark_training",
+            name="langpark_ablation_align_only_training",
             dir=cfg.wandb_dir,
         )
         os.makedirs(cfg.run_root_dir, exist_ok=True)
@@ -184,13 +198,13 @@ def train_langpark(cfg: LangParkVLAConfig):
         AutoConfig.register("openvla", OpenVLAConfig)
         AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, LangParkVLAForActionPrediction)
+        AutoModelForVision2Seq.register(OpenVLAConfig, LangParkAlignOnlyVLAForActionPrediction)
 
     processor     = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     tokenizer     = processor.tokenizer
     pad_token_id  = tokenizer.pad_token_id if tokenizer.pad_token_id else 0
 
-    vla = LangParkVLAForActionPrediction.from_pretrained(
+    vla = LangParkAlignOnlyVLAForActionPrediction.from_pretrained(
         cfg.vla_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
@@ -222,20 +236,16 @@ def train_langpark(cfg: LangParkVLAConfig):
 
     vla = wrap_ddp(vla, device_id, use_distributed)
 
-    # ── 2. External modules ───────────────────────────────────────────────────
+    # ── 2. External modules (alignment head kept, MEM module removed) ─────────
 
     llm_dim    = unwrap(vla).config.text_config.hidden_size
     vocab_size = unwrap(vla).config.text_config.vocab_size
 
-    def make_projector():
-        return nn.Sequential(
-            nn.Linear(4, llm_dim // 2),
-            nn.GELU(),
-            nn.Linear(llm_dim // 2, llm_dim),
-        ).to(device_id).to(torch.bfloat16)
-
-    past_traj_projector = make_projector()
-    full_hist_projector = make_projector()
+    past_traj_projector = nn.Sequential(
+        nn.Linear(4, llm_dim // 2),
+        nn.GELU(),
+        nn.Linear(llm_dim // 2, llm_dim),
+    ).to(device_id).to(torch.bfloat16)
 
     action_head = nn.Sequential(
         nn.Linear(llm_dim, llm_dim),
@@ -244,10 +254,6 @@ def train_langpark(cfg: LangParkVLAConfig):
     ).to(device_id).to(torch.bfloat16)
 
     decision_head = nn.Linear(llm_dim, vocab_size).to(device_id).to(torch.bfloat16)
-
-    mem_module = MemoryEnhancementModule(
-        llm_dim, cfg.num_mem_tokens, cfg.mem_num_heads
-    ).to(device_id).to(torch.bfloat16)
 
     align_head = InstructionAlignmentHead(
         llm_dim, cfg.align_num_heads
@@ -264,24 +270,19 @@ def train_langpark(cfg: LangParkVLAConfig):
             model.load_state_dict(cleaned)
 
         load_ckpt(past_traj_projector, os.path.join(cfg.resume_dir, "past_traj_projector.pt"))
-        load_ckpt(full_hist_projector, os.path.join(cfg.resume_dir, "full_hist_projector.pt"))
         load_ckpt(action_head,         os.path.join(cfg.resume_dir, "action_head.pt"))
         load_ckpt(decision_head,       os.path.join(cfg.resume_dir, "decision_head.pt"))
-        load_ckpt(mem_module,          os.path.join(cfg.resume_dir, "mem_module.pt"))
         load_ckpt(align_head,          os.path.join(cfg.resume_dir, "align_head.pt"))
         if distributed_state.is_main_process:
             print(f"Resumed all external modules from {cfg.resume_dir}")
 
     # Wrap all external modules with DDP (no-op on single GPU)
     past_traj_projector = wrap_ddp(past_traj_projector, device_id, use_distributed)
-    full_hist_projector = wrap_ddp(full_hist_projector, device_id, use_distributed)
     action_head         = wrap_ddp(action_head,         device_id, use_distributed)
     decision_head       = wrap_ddp(decision_head,       device_id, use_distributed)
-    mem_module          = wrap_ddp(mem_module,          device_id, use_distributed)
     align_head          = wrap_ddp(align_head,          device_id, use_distributed)
 
-    all_modules = (vla, past_traj_projector, full_hist_projector,
-                   action_head, decision_head, mem_module, align_head)
+    all_modules = (vla, past_traj_projector, action_head, decision_head, align_head)
 
     # ── 3. Dataset and DataLoader ─────────────────────────────────────────────
 
@@ -312,10 +313,8 @@ def train_langpark(cfg: LangParkVLAConfig):
     trainable_params = (
         [p for p in vla.parameters() if p.requires_grad]
         + list(past_traj_projector.parameters())
-        + list(full_hist_projector.parameters())
         + list(action_head.parameters())
         + list(decision_head.parameters())
-        + list(mem_module.parameters())
         + list(align_head.parameters())
     )
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
@@ -362,7 +361,7 @@ def train_langpark(cfg: LangParkVLAConfig):
     os.makedirs(visualize_dir, exist_ok=True)
 
     NUM_ACT = FUTURE_ACTION_WAYPOINTS * ACTION_DIM   # 32
-    NUM_MEM = cfg.num_mem_tokens                      # 16
+    NUM_MEM = cfg.num_mem_tokens                      # 16 (zero placeholder slots)
 
     # ── 6. Training loop ──────────────────────────────────────────────────────
 
@@ -390,23 +389,22 @@ def train_langpark(cfg: LangParkVLAConfig):
                         sync_ctx.enter_context(m.no_sync())
 
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    # Forward
+                    # Forward (16 zero-placeholder memory slots, no MEM module)
                     outputs = vla(
                         batch,
                         past_traj_projector=past_traj_projector,
-                        full_hist_projector=full_hist_projector,
-                        mem_module=mem_module,
+                        num_mem_tokens=cfg.num_mem_tokens,
                     )
                     last_hidden = outputs.hidden_states[-1]   # [B, Seq, D]
 
-                    # ── dec / act hidden states (same indexing as ExpVLA) ──────────
-                    # Tail layout: ... MEM(16) | dec(1) | act(32) | EOS(1)
+                    # ── dec / act hidden states (same indexing as full model) ──────
+                    # Tail layout: ... MEM_ZERO(16) | dec(1) | act(32) | EOS(1)
                     # Hidden at pos -(NUM_ACT+3) = MEM[15]: predicts dec (autoregressive shift)
                     # Hidden at pos -(NUM_ACT+2):-2 = dec..act[30]: predicts act[0]..act[31]
                     decision_hidden = last_hidden[:, -(NUM_ACT + 3), :]
                     actions_hidden  = last_hidden[:, -(NUM_ACT + 2):-2, :]
 
-                    # ── MEM hidden states ──────────────────────────────────────────
+                    # ── MEM (zero-slot) hidden states for alignment head ───────────
                     # MEM[0..15] at positions -(NUM_ACT+2+16) to -(NUM_ACT+2) exclusive
                     mem_hidden = last_hidden[:, -(NUM_ACT + 2 + NUM_MEM):-(NUM_ACT + 2), :]  # [B, 16, D]
 
@@ -457,7 +455,7 @@ def train_langpark(cfg: LangParkVLAConfig):
                     # Decision (slot id) classification
                     l_decision = ce_loss(pred_decision_logits, gt_decision)
 
-                    # Instruction alignment
+                    # Instruction alignment (head attends to the zero-slot hidden states)
                     align_logits = align_head(
                         outputs.instruct_emb, mem_hidden, outputs.instruct_mask
                     )   # [B, L_inst, 3]
@@ -511,6 +509,7 @@ def train_langpark(cfg: LangParkVLAConfig):
                     "XY1":     f"{l_xy_1st.item():.4f}",
                     "XY2":     f"{l_xy_2nd.item():.4f}",
                     "Dec":     f"{l_decision.item():.4f}",
+                    "Align":   f"{l_align.item():.4f}",
                     "Elapsed": elapsed_str,
                     "ETA":     eta_str,
                 })
@@ -542,10 +541,8 @@ def train_langpark(cfg: LangParkVLAConfig):
                         vla=vla,
                         processor=processor,
                         past_traj_projector=past_traj_projector,
-                        full_hist_projector=full_hist_projector,
                         action_head=action_head,
                         decision_head=decision_head,
-                        mem_module=mem_module,
                         align_head=align_head,
                         loss=total_loss.item(),
                     )
@@ -583,10 +580,8 @@ def train_langpark(cfg: LangParkVLAConfig):
             vla=vla,
             processor=processor,
             past_traj_projector=past_traj_projector,
-            full_hist_projector=full_hist_projector,
             action_head=action_head,
             decision_head=decision_head,
-            mem_module=mem_module,
             align_head=align_head,
             loss=total_loss.item(),
         )
@@ -598,4 +593,4 @@ def train_langpark(cfg: LangParkVLAConfig):
 
 
 if __name__ == "__main__":
-    train_langpark()
+    train_langpark_ablation_align_only()

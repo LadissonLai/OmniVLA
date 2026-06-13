@@ -1,3 +1,16 @@
+"""
+test_langpark_no_iam.py
+
+Evaluation for Ablation #1 (baseline): NO MemoryEnhancementModule,
+NO InstructionAlignmentHead.
+
+Mirrors test_langpark.py but:
+  - Uses the base `ExpVLAForActionPrediction` forward (no MEM tokens).
+  - Loads only past_traj_projector / action_head / decision_head.
+  - Drops the Language Progress Accuracy metric (no alignment head).
+  - Visualization drops the instruction-alignment panel.
+"""
+
 import os
 import time
 import torch
@@ -14,8 +27,7 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from peft import PeftModel
 
 from core.langpark_dataset import LangParkDataset, langpark_collate_fn
-from core.langpark_modules import MemoryEnhancementModule, InstructionAlignmentHead
-from core.modeling_langpark import LangParkVLAForActionPrediction
+from core.modeling_prismatic import ExpVLAForActionPrediction
 from core.configuration_prismatic import OpenVLAConfig
 from core.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from core.utils import model_is_on_hf_hub, visualize_langpark
@@ -23,15 +35,15 @@ from core.constants import ACTION_DIM, FUTURE_ACTION_WAYPOINTS
 
 
 @dataclass
-class TestLangParkConfig:
+class TestLangParkNoIAMConfig:
     # Paths
     vla_path:    str = "/root/autodl-tmp/codes/OmniVLA/openvla-7b"
-    resume_dir:  str = "/root/autodl-tmp/codes/OmniVLA/runs/runs_langpark/2026-06-12_20-08/step_10240_loss_0.0284_ckpt"
+    resume_dir:  str = ""   # set to the ablation_no_iam checkpoint dir
     data_root:   str = "/root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA_testsets/"
-    output_file: str = "metrics/test_langpark_4H20_6epoch2.txt"
+    output_file: str = "metrics/test_langpark_ablation_no_iam.txt"
 
     # DataLoader
-    batch_size:  int = 20
+    batch_size:  int = 24
     num_workers: int = 4
 
     # History config (must match training)
@@ -40,14 +52,9 @@ class TestLangParkConfig:
     turn_yaw_thresh:     float = 5.0
     turn_dense_interval: float = 0.1
 
-    # IAM module config (must match training)
-    num_mem_tokens:  int = 16
-    mem_num_heads:   int = 8
-    align_num_heads: int = 8
-
     # Visualization (mutually exclusive with metric evaluation)
     save_vis: bool = False
-    vis_dir:  str  = "vis_langpark_result2"
+    vis_dir:  str  = "vis_langpark_ablation_no_iam_result"
 
 
 def calc_l2(pred: torch.Tensor, gt: torch.Tensor) -> float:
@@ -76,10 +83,10 @@ def gather_lists(local_list: list, use_distributed: bool, world_size: int) -> li
 
 
 @draccus.wrap()
-def evaluate_langpark(cfg: TestLangParkConfig):
+def evaluate_langpark_ablation_no_iam(cfg: TestLangParkNoIAMConfig):
     # ── 0. Distributed state (single-GPU: use_distributed=False, degrades to original) ──
-    # Launch single GPU : python hf_vla/test_langpark.py
-    # Launch multi  GPU : torchrun --nproc_per_node=4 hf_vla/test_langpark.py
+    # Launch single GPU : python hf_vla/test_langpark_no_iam.py
+    # Launch multi  GPU : torchrun --nproc_per_node=4 hf_vla/test_langpark_no_iam.py
     distributed_state = PartialState()
     use_distributed   = distributed_state.use_distributed
     device_id         = distributed_state.local_process_index
@@ -94,7 +101,7 @@ def evaluate_langpark(cfg: TestLangParkConfig):
         AutoConfig.register("openvla", OpenVLAConfig)
         AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, LangParkVLAForActionPrediction)
+        AutoModelForVision2Seq.register(OpenVLAConfig, ExpVLAForActionPrediction)
 
     if is_main:
         print("Loading processor and base model...")
@@ -102,7 +109,7 @@ def evaluate_langpark(cfg: TestLangParkConfig):
     tokenizer    = processor.tokenizer
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id else 0
 
-    vla = LangParkVLAForActionPrediction.from_pretrained(
+    vla = ExpVLAForActionPrediction.from_pretrained(
         cfg.vla_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
@@ -115,29 +122,19 @@ def evaluate_langpark(cfg: TestLangParkConfig):
         vla, os.path.join(cfg.resume_dir, "lora_adapter"), is_trainable=False
     )
 
-    # ── 2. External modules ───────────────────────────────────────────────────
+    # ── 2. External modules (no MEM module, no alignment head) ────────────────
     llm_dim    = vla.config.text_config.hidden_size
     vocab_size = vla.config.text_config.vocab_size
 
-    def make_projector() -> nn.Module:
-        return nn.Sequential(
-            nn.Linear(4, llm_dim // 2),
-            nn.GELU(),
-            nn.Linear(llm_dim // 2, llm_dim),
-        ).to(device).to(torch.bfloat16)
-
-    past_traj_projector = make_projector()
-    full_hist_projector = make_projector()
+    past_traj_projector = nn.Sequential(
+        nn.Linear(4, llm_dim // 2),
+        nn.GELU(),
+        nn.Linear(llm_dim // 2, llm_dim),
+    ).to(device).to(torch.bfloat16)
     action_head   = nn.Sequential(
         nn.Linear(llm_dim, llm_dim), nn.GELU(), nn.Linear(llm_dim, 1)
     ).to(device).to(torch.bfloat16)
     decision_head = nn.Linear(llm_dim, vocab_size).to(device).to(torch.bfloat16)
-    mem_module    = MemoryEnhancementModule(
-        llm_dim, cfg.num_mem_tokens, cfg.mem_num_heads
-    ).to(device).to(torch.bfloat16)
-    align_head    = InstructionAlignmentHead(
-        llm_dim, cfg.align_num_heads
-    ).to(device).to(torch.bfloat16)
 
     def load_ckpt(model: nn.Module, path: str) -> None:
         state_dict = torch.load(path, map_location=device)
@@ -148,14 +145,10 @@ def evaluate_langpark(cfg: TestLangParkConfig):
         model.load_state_dict(cleaned)
 
     load_ckpt(past_traj_projector, os.path.join(cfg.resume_dir, "past_traj_projector.pt"))
-    load_ckpt(full_hist_projector, os.path.join(cfg.resume_dir, "full_hist_projector.pt"))
     load_ckpt(action_head,         os.path.join(cfg.resume_dir, "action_head.pt"))
     load_ckpt(decision_head,       os.path.join(cfg.resume_dir, "decision_head.pt"))
-    load_ckpt(mem_module,          os.path.join(cfg.resume_dir, "mem_module.pt"))
-    load_ckpt(align_head,          os.path.join(cfg.resume_dir, "align_head.pt"))
 
-    for m in (vla, past_traj_projector, full_hist_projector,
-              action_head, decision_head, mem_module, align_head):
+    for m in (vla, past_traj_projector, action_head, decision_head):
         m.eval()
 
     # ── 3. Dataset & DataLoader ───────────────────────────────────────────────
@@ -186,7 +179,6 @@ def evaluate_langpark(cfg: TestLangParkConfig):
 
     # ── 4. Evaluation loop ────────────────────────────────────────────────────
     NUM_ACT = FUTURE_ACTION_WAYPOINTS * ACTION_DIM  # 32
-    NUM_MEM = cfg.num_mem_tokens                     # 16
 
     # ── Visualization branch (mutually exclusive with metric loop) ────────────
     if cfg.save_vis:
@@ -216,21 +208,15 @@ def evaluate_langpark(cfg: TestLangParkConfig):
                     outputs = vla(
                         batch,
                         past_traj_projector=past_traj_projector,
-                        full_hist_projector=full_hist_projector,
-                        mem_module=mem_module,
                     )
                     last_hidden = outputs.hidden_states[-1]
 
                     decision_hidden = last_hidden[:, -(NUM_ACT + 3), :]
                     actions_hidden  = last_hidden[:, -(NUM_ACT + 2):-2, :]
-                    mem_hidden      = last_hidden[:, -(NUM_ACT + 2 + NUM_MEM):-(NUM_ACT + 2), :]
 
                     pred_decision_logits = decision_head(decision_hidden)
                     pred_actions = action_head(actions_hidden).squeeze(-1).view(
                         -1, FUTURE_ACTION_WAYPOINTS, ACTION_DIM
-                    )
-                    align_logits = align_head(
-                        outputs.instruct_emb, mem_hidden, outputs.instruct_mask
                     )
 
                 pred_dec_str = tokenizer.decode(
@@ -238,18 +224,10 @@ def evaluate_langpark(cfg: TestLangParkConfig):
                 ).replace("<pad>", "").strip()
                 gt_dec_str = tokenizer.decode(gt_decision[0].item()).replace("<pad>", "").strip()
 
-                instruct_ids = batch['instruct_ids'][0]        # [L_inst]
-                align_label  = batch['align_label'][0]         # [L_inst]
-                align_pred   = align_logits.argmax(dim=-1)[0].cpu()  # [L_inst]
-
-                # Align lengths defensively
-                min_len     = min(instruct_ids.shape[0], align_pred.shape[0])
-                token_texts = [tokenizer.convert_ids_to_tokens(instruct_ids[i].item()) for i in range(min_len)]
-                gt_labels   = align_label[:min_len].tolist()
-                pred_labels = align_pred[:min_len].tolist()
-
                 past_traj_vis = batch['history_traj'][0] if batch['history_traj'] else None
 
+                # No instruction-alignment head in this ablation: pass empty
+                # token/label lists so visualize_langpark renders no align panel.
                 vis_path = os.path.join(cfg.vis_dir, traj_name, f"step_{frame_t:06d}.png")
                 visualize_langpark(
                     save_path=vis_path,
@@ -263,9 +241,9 @@ def evaluate_langpark(cfg: TestLangParkConfig):
                     image_rear=batch['pixel_values_rear'][0],
                     image_left=batch['pixel_values_left'][0],
                     image_right=batch['pixel_values_right'][0],
-                    token_texts=token_texts,
-                    gt_labels=gt_labels,
-                    pred_labels=pred_labels,
+                    token_texts=[],
+                    gt_labels=[],
+                    pred_labels=[],
                 )
         distributed_state.wait_for_everyone()
         return  # skip metric evaluation
@@ -273,13 +251,11 @@ def evaluate_langpark(cfg: TestLangParkConfig):
     l2_1s, l2_2s, l2_3s       = [], [], []
     yaw_1s, yaw_2s, yaw_3s    = [], [], []
     dec_correct                = []
-    align_acc                  = []
     inf_time                   = []
 
     for batch in tqdm(dataloader, desc="Evaluating", disable=not is_main):
         gt_action    = batch['action_gt'].to(device).to(torch.bfloat16)  # [B, 8, 4]
         gt_decision  = batch['decision_gt'].to(device)                    # [B]
-        align_labels = batch['align_label'].to(device)                    # [B, L_inst]
         B = gt_action.shape[0]
 
         t0 = time.time()
@@ -287,28 +263,20 @@ def evaluate_langpark(cfg: TestLangParkConfig):
             outputs = vla(
                 batch,
                 past_traj_projector=past_traj_projector,
-                full_hist_projector=full_hist_projector,
-                mem_module=mem_module,
             )
             last_hidden = outputs.hidden_states[-1]
 
-            # Tail layout: ... MEM(16) | dec(1) | act(32) | EOS(1)
+            # Tail layout: ... p_slots | dec(1) | act(32) | EOS(1)
             decision_hidden = last_hidden[:, -(NUM_ACT + 3), :]
             actions_hidden  = last_hidden[:, -(NUM_ACT + 2):-2, :]
-            mem_hidden      = last_hidden[:, -(NUM_ACT + 2 + NUM_MEM):-(NUM_ACT + 2), :]
 
             pred_decision_logits = decision_head(decision_hidden)             # [B, vocab]
             pred_actions         = action_head(actions_hidden).squeeze(-1)    # [B, 32]
             pred_actions         = pred_actions.view(-1, FUTURE_ACTION_WAYPOINTS, ACTION_DIM)
 
-            align_logits = align_head(
-                outputs.instruct_emb, mem_hidden, outputs.instruct_mask
-            )  # [B, L_inst, 3]
-
         per_sample_time = (time.time() - t0) / B
 
         pred_decisions = pred_decision_logits.argmax(dim=-1)  # [B]
-        align_preds    = align_logits.argmax(dim=-1)          # [B, L_inst]
 
         for i in range(B):
             p = pred_actions[i].cpu().float()
@@ -324,13 +292,6 @@ def evaluate_langpark(cfg: TestLangParkConfig):
 
             dec_correct.append(int(pred_decisions[i].item() == gt_decision[i].item()))
 
-            # Language progress accuracy: ignore -100 positions
-            valid = (align_labels[i] != -100)
-            if valid.sum() > 0:
-                align_acc.append(
-                    (align_preds[i][valid] == align_labels[i][valid]).float().mean().item()
-                )
-
             inf_time.append(per_sample_time)
 
     # ── 5. Gather metrics across ranks (no-op on single GPU) ──────────────────
@@ -341,7 +302,6 @@ def evaluate_langpark(cfg: TestLangParkConfig):
     yaw_2s      = gather_lists(yaw_2s,      use_distributed, world_size)
     yaw_3s      = gather_lists(yaw_3s,      use_distributed, world_size)
     dec_correct = gather_lists(dec_correct, use_distributed, world_size)
-    align_acc   = gather_lists(align_acc,   use_distributed, world_size)
     inf_time    = gather_lists(inf_time,    use_distributed, world_size)
 
     # Only the main process computes / prints / writes the summary.
@@ -352,7 +312,7 @@ def evaluate_langpark(cfg: TestLangParkConfig):
     # ── 6. Summary ────────────────────────────────────────────────────────────
     total = len(l2_1s)
     summary = (
-        "========== LangPark VLA Evaluation Results ==========\n"
+        "===== LangPark VLA Evaluation (Ablation #1: no MEM / no IAM) =====\n"
         f"Checkpoint:                          {cfg.resume_dir}\n"
         f"Data root:                           {cfg.data_root}\n"
         f"Total Samples Evaluated:             {total}\n\n"
@@ -363,7 +323,6 @@ def evaluate_langpark(cfg: TestLangParkConfig):
         f"Average Yaw Err 2s (4th pt):         {np.mean(yaw_2s):.4f} rad\n"
         f"Average Yaw Err 3s (6th pt):         {np.mean(yaw_3s):.4f} rad\n"
         f"Average Decision Accuracy:           {np.mean(dec_correct) * 100:.2f}%\n"
-        f"Average Language Progress Accuracy:  {np.mean(align_acc) * 100:.2f}%\n"
         f"Average Inference Time:              {np.mean(inf_time):.4f} s/sample\n"
     )
 
@@ -378,4 +337,4 @@ def evaluate_langpark(cfg: TestLangParkConfig):
 
 
 if __name__ == "__main__":
-    evaluate_langpark()
+    evaluate_langpark_ablation_no_iam()
