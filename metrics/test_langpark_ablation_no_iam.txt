@@ -1,0 +1,13 @@
+===== LangPark VLA Evaluation (Ablation #1: no MEM / no IAM) =====
+Checkpoint:                          /root/autodl-tmp/codes/OmniVLA/runs/runs_langpark_ablation_no_iam/2026-06-14_02-57/step_6888_loss_0.0284_ckpt
+Data root:                           /root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA_testsets/
+Total Samples Evaluated:             24276
+
+Average L2 Dist 1s (2nd pt):         0.2571 m
+Average L2 Dist 2s (4th pt):         0.5119 m
+Average L2 Dist 3s (6th pt):         0.7398 m
+Average Yaw Err 1s (2nd pt):         0.0259 rad
+Average Yaw Err 2s (4th pt):         0.0450 rad
+Average Yaw Err 3s (6th pt):         0.0714 rad
+Average Decision Accuracy:           96.49%
+Average Inference Time:              0.1318 s/sample
