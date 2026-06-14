@@ -304,13 +304,10 @@ class ClassicVLADataset(Dataset):
         self.turn_dense_interval = turn_dense_interval
 
         self.samples = []
-        self.pos_indices = []
-        self.neg_indices = []
         self._build_dataset()
 
     def _build_dataset(self):
         traj_dirs = find_traj_dirs(self.data_root)
-        idx = 0
         for traj_dir in traj_dirs:
             with open(os.path.join(traj_dir, "decision.txt"), 'r') as f:
                 lines = f.readlines()
@@ -325,7 +322,8 @@ class ClassicVLADataset(Dataset):
             for t in range(num_frames):
                 curr_slots = slots_data[t]
                 visible_ids = [slot['id'] for slot in curr_slots]
-                decision_id = true_decision_id if true_decision_id in visible_ids and t >= num_frames - 1 else 0
+                # 与 LangPark 一致：当前帧车位列表里出现最终决策 id 即打 gt 标签，否则为 0
+                decision_id = true_decision_id if true_decision_id in visible_ids else 0
 
                 sample = {
                     'traj_dir': traj_dir,
@@ -336,13 +334,7 @@ class ClassicVLADataset(Dataset):
                     'odom': odom_df
                 }
                 self.samples.append(sample)
-                if t >= num_frames - 1:
-                    self.pos_indices.append(idx)
-                else:
-                    self.neg_indices.append(idx)
-                idx += 1
-        print(f"ClassicVLADataset built: {len(self.samples)} samples "
-              f"({len(self.pos_indices)} Pos, {len(self.neg_indices)} Neg).")
+        print(f"ClassicVLADataset built: {len(self.samples)} samples from {len(traj_dirs)} trajectories.")
 
     def __len__(self):
         return len(self.samples)
@@ -437,7 +429,7 @@ class ClassicVLADataset(Dataset):
         # 停车槽文本
         slots_str = "[]"
         if len(sample['slots']) > 0:
-            slots_str = "Detected parking slots:[" + ",".join(
+            slots_str = "[" + ",".join(
                 [f"(id={s['id']},x={s['x']:.2f},y={s['y']:.2f})" for s in sample['slots']]) + "]"
 
         # 历史轨迹文本化
@@ -525,7 +517,8 @@ class SingleTrajClassicTestDataset(Dataset):
         for t in range(num_frames):
             curr_slots = slots_data[t]
             visible_ids = [slot['id'] for slot in curr_slots]
-            decision_id = true_decision_id if true_decision_id in visible_ids and t >= num_frames - 1 else 0
+            # 与 LangPark / 训练集一致：可见即打 gt 标签，否则为 0
+            decision_id = true_decision_id if true_decision_id in visible_ids else 0
             self.samples.append({
                 'traj_dir': self.traj_dir,
                 't': t,
@@ -626,7 +619,7 @@ class SingleTrajClassicTestDataset(Dataset):
 
         slots_str = "[]"
         if len(sample['slots']) > 0:
-            slots_str = "Detected parking slots:[" + ",".join(
+            slots_str = "[" + ",".join(
                 [f"(id={s['id']},x={s['x']:.2f},y={s['y']:.2f})" for s in sample['slots']]) + "]"
 
         hist_text = traj_to_text(history_arr)
