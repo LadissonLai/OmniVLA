@@ -38,12 +38,12 @@ from core.constants import ACTION_DIM, FUTURE_ACTION_WAYPOINTS
 class TestLangParkNoIAMConfig:
     # Paths
     vla_path:    str = "/root/autodl-tmp/codes/OmniVLA/openvla-7b"
-    resume_dir:  str = ""   # set to the ablation_no_iam checkpoint dir
+    resume_dir:  str = "/root/autodl-tmp/codes/OmniVLA/runs/runs_langpark_ablation_no_iam/2026-06-14_02-57/step_6888_loss_0.0284_ckpt"   # set to the ablation_no_iam checkpoint dir
     data_root:   str = "/root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA_testsets/"
     output_file: str = "metrics/test_langpark_ablation_no_iam.txt"
 
     # DataLoader
-    batch_size:  int = 24
+    batch_size:  int = 16
     num_workers: int = 4
 
     # History config (must match training)
