@@ -354,14 +354,14 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         )
 
         # Instantiate LLM Backbone, config._attn_implementation = sdpa, 原作者修改了源码，这里是双向注意力
-        self.language_model = AutoModelForCausalLM.from_config(
-            config.text_config, attn_implementation=config._attn_implementation
-        )
+        # self.language_model = AutoModelForCausalLM.from_config(
+        #     config.text_config, attn_implementation=config._attn_implementation
+        # )
         
         # 单向因果注意力
-        # self.language_model = AutoModelForCausalLM.from_config(
-        #     config.text_config, attn_implementation="flash_attention_2"
-        # )
+        self.language_model = AutoModelForCausalLM.from_config(
+            config.text_config, attn_implementation="flash_attention_2"
+        )
         
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = config.pad_token_id

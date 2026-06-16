@@ -39,14 +39,14 @@ class ClassicVLATrainConfig:
     run_root_dir: Path = Path("runs/runs_classicvla_smart_history")
 
     # 训练超参数（batch_size 为每张卡）
-    batch_size: int = 2
+    batch_size: int = 3
     learning_rate: float = 1e-4
-    grad_accumulation_steps: int = 16
-    epochs: int = 15
-    save_freq: int = 512          # 单位：优化器步
+    grad_accumulation_steps: int = 4
+    epochs: int = 6
+    save_freq: int = 4000          # 单位：优化器步
     resume: bool = False
     resume_dir: str = ""
-    num_workers: int = 2          # 每进程
+    num_workers: int = 4          # 每进程
 
     # 学习率调度（按总优化器步数的比例）：
     # 前 warmup_ratio 线性从 10% 预热到 100%，之后恒定，
