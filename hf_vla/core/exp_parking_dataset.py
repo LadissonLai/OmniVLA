@@ -647,12 +647,125 @@ class SingleTrajClassicTestDataset(Dataset):
         }
 
 
+class MultiTrajClassicTestDataset(Dataset):
+    """ClassicVLA 推理用：跨所有轨迹展开为统一样本集，支持批量 / 多卡并行测试。
+
+    与 ClassicVLADataset 的历史/未来/slots 处理逻辑保持一致；额外返回 action_gt、
+    decision_gt(int) 以及元数据 traj_name / step_idx / is_last（是否轨迹末帧），
+    供测试时按轨迹聚合指标、计算 Parking Success。
+    """
+    def __init__(self, data_root, tokenizer, image_transform, max_history=8, future_steps=8,
+                 history_mode='fixed_count', distance_interval=0.5, turn_yaw_thresh=5.0, turn_dense_interval=0.1):
+        self.data_root = data_root
+        self.tokenizer = tokenizer
+        self.image_transform = image_transform
+        self.max_history = max_history
+        self.future_steps = future_steps
+        self.history_mode = history_mode
+        self.distance_interval = distance_interval
+        self.turn_yaw_thresh = turn_yaw_thresh
+        self.turn_dense_interval = turn_dense_interval
+        self.samples = []
+        self._build_dataset()
+
+    def _build_dataset(self):
+        traj_dirs = find_traj_dirs(self.data_root)
+        for traj_dir in traj_dirs:
+            with open(os.path.join(traj_dir, "decision.txt"), 'r') as f:
+                lines = f.readlines()
+                instruction = lines[0].strip()
+                true_decision_id = int(lines[1].strip())
+
+            odom_df = pd.read_csv(os.path.join(traj_dir, "odom.csv"))
+            with open(os.path.join(traj_dir, "parking_slots.txt"), 'r') as f:
+                slots_data = [json.loads(line) for line in f.readlines()]
+
+            traj_name = os.path.basename(traj_dir)
+            num_frames = len(odom_df)
+            for t in range(num_frames):
+                curr_slots = slots_data[t]
+                visible_ids = [slot['id'] for slot in curr_slots]
+                decision_id = true_decision_id if true_decision_id in visible_ids else 0
+                self.samples.append({
+                    'traj_dir': traj_dir,
+                    'traj_name': traj_name,
+                    't': t,
+                    'is_last': (t == num_frames - 1),
+                    'instruction': instruction,
+                    'decision_id': decision_id,
+                    'slots': curr_slots,
+                    'odom': odom_df
+                })
+        print(f"MultiTrajClassicTestDataset built: {len(self.samples)} samples from {len(traj_dirs)} trajectories.")
+
+    def __len__(self):
+        return len(self.samples)
+
+    # 历史轨迹提取逻辑与 ClassicVLADataset 完全一致
+    _get_history_traj = ClassicVLADataset._get_history_traj
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        t = sample['t']
+        odom = sample['odom']
+        traj_dir = sample['traj_dir']
+
+        images = {}
+        for view in ['front', 'rear', 'left', 'right']:
+            img_path = os.path.join(traj_dir, "images", view, f"{t+1:06d}.png")
+            img = Image.open(img_path).convert("RGB")
+            images[view] = self.image_transform(img)
+
+        curr_state = odom.iloc[t]
+        history_arr = self._get_history_traj(odom, t, curr_state)
+
+        future_df = odom.iloc[t + 1: t + 1 + self.future_steps]
+        future_traj = [to_local_coords(row['x'], row['y'], row['yaw'],
+                                       curr_state['x'], curr_state['y'], curr_state['yaw'])
+                       for _, row in future_df.iterrows()]
+        while len(future_traj) < self.future_steps:
+            future_traj.append(future_traj[-1] if future_traj else np.zeros(4))
+        action_tensor = torch.tensor(np.array(future_traj), dtype=torch.float32)
+
+        slots_str = "[]"
+        if len(sample['slots']) > 0:
+            slots_str = "[" + ",".join(
+                [f"(id={s['id']},x={s['x']:.2f},y={s['y']:.2f})" for s in sample['slots']]) + "]"
+
+        hist_text = traj_to_text(history_arr)
+
+        def tokenize(text):
+            return torch.tensor(self.tokenizer.encode(text, add_special_tokens=False), dtype=torch.long)
+
+        return {
+            'pixel_values_front': images['front'],
+            'pixel_values_rear': images['rear'],
+            'pixel_values_left': images['left'],
+            'pixel_values_right': images['right'],
+            'action_gt': action_tensor,
+            'decision_gt': torch.tensor(sample['decision_id'], dtype=torch.long),
+            'instruction': sample['instruction'],
+            'traj_name': sample['traj_name'],
+            'step_idx': torch.tensor(sample['t'], dtype=torch.long),
+            'is_last': torch.tensor(1 if sample['is_last'] else 0, dtype=torch.long),
+            'sys_prompt_ids': tokenize("Please predict the future trajectory and select the parking slot id based on the human instruction, the current four observation images, the history trajectory, and the detected parking slots."),
+            'instruct_ids': tokenize(f"Instruction: {sample['instruction']}"),
+            'p_front_ids': tokenize("Front view:"),
+            'p_rear_ids': tokenize("Rear view:"),
+            'p_left_ids': tokenize("Left view:"),
+            'p_right_ids': tokenize("Right view:"),
+            'p_hist_ids': tokenize(f"History trajectory:{hist_text}"),
+            'p_slots_ids': tokenize(f"Detected parking slot information: {slots_str}"),
+            'p_answer_ids': tokenize("Answer: "),
+        }
+
+
 def classic_collate_fn(batch, pad_token_id=0):
     """ClassicVLA 专用 collate：output_ids/eos_ids 也做右 padding"""
     from .constants import IGNORE_INDEX
     collated = {}
     for key in batch[0].keys():
-        if key == 'instruction':
+        if key in ('instruction', 'traj_name'):
             collated[key] = [item[key] for item in batch]
         elif key.endswith('_ids'):
             collated[key] = pad_sequence(

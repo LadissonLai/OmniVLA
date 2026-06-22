@@ -1,0 +1,14 @@
+===== LangPark VLA Evaluation (Ablation #3: align head only, no MEM module) =====
+Checkpoint:                          /root/autodl-tmp/codes/OmniVLA/runs/runs_langpark_ablation_align_only/2026-06-18_04-59/step_6424_loss_0.0785_ckpt
+Data root:                           /root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA_testsets/
+Total Samples Evaluated:             24276
+
+Average L2 Dist 1s (2nd pt):         0.2610 m
+Average L2 Dist 2s (4th pt):         0.5092 m
+Average L2 Dist 3s (6th pt):         0.7269 m
+Average Yaw Err 1s (2nd pt):         0.0310 rad
+Average Yaw Err 2s (4th pt):         0.0448 rad
+Average Yaw Err 3s (6th pt):         0.0672 rad
+Average Decision Accuracy:           96.76%
+Average Language Progress Accuracy:  83.33%
+Average Inference Time:              0.1356 s/sample

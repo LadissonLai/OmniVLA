@@ -1,0 +1,14 @@
+========== LangPark VLA Evaluation Results ==========
+Checkpoint:                          /root/autodl-tmp/codes/OmniVLA/runs/runs_langpark_additional/2026-06-22_16-27/step_759_loss_0.0957_ckpt
+Data root:                           /root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA_testsets/
+Total Samples Evaluated:             24276
+
+Average L2 Dist 1s (2nd pt):         0.2179 m
+Average L2 Dist 2s (4th pt):         0.3328 m
+Average L2 Dist 3s (6th pt):         0.3899 m
+Average Yaw Err 1s (2nd pt):         0.0282 rad
+Average Yaw Err 2s (4th pt):         0.0355 rad
+Average Yaw Err 3s (6th pt):         0.0506 rad
+Average Decision Accuracy:           99.91%
+Average Language Progress Accuracy:  83.57%
+Average Inference Time:              0.1447 s/sample

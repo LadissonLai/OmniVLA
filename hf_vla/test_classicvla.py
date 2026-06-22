@@ -5,28 +5,29 @@ import time
 import torch
 import numpy as np
 from dataclasses import dataclass
+from collections import defaultdict
 from tqdm import tqdm
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from transformers import AutoProcessor, AutoConfig, AutoImageProcessor, AutoModelForVision2Seq
 from peft import PeftModel
 from accelerate import PartialState
 from accelerate.utils import gather_object
 import draccus
 
-from core.exp_parking_dataset import SingleTrajClassicTestDataset, classic_collate_fn
+from core.exp_parking_dataset import MultiTrajClassicTestDataset, classic_collate_fn
 from core.modeling_prismatic import ClassicVLAForActionPrediction
 from core.configuration_prismatic import OpenVLAConfig
 from core.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from core.utils import model_is_on_hf_hub, visualize_test_expvla
+from core.utils import model_is_on_hf_hub
 from core.constants import FUTURE_ACTION_WAYPOINTS, ACTION_DIM
 
 
 @dataclass
 class ClassicVLATestConfig:
     vla_path: str = "/root/autodl-tmp/codes/OmniVLA/openvla-7b"
-    resume_dir: str = "/root/autodl-tmp/codes/OmniVLA/runs/runs_classicvla_smart_history/2026-05-04_14-42/step_56010_loss_0.1578_ckpt"
-    data_root: str = "/root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA_Val"
-    output_file: str = "test_classicvla_smart_history_16epoch.txt"
+    resume_dir: str = "/root/autodl-tmp/codes/OmniVLA/runs/runs_classicvla_smart_history/2026-06-15_17-23/step_12852_loss_0.3333_ckpt"
+    data_root: str = "/root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA_testsets"
+    output_file: str = "metrics/test_classicvla_smart_history_H20_6epoch.txt"
 
     history_mode: str = 'smart'
     max_history: int = 8
@@ -37,9 +38,9 @@ class ClassicVLATestConfig:
 
     max_new_tokens: int = 512
 
-    # 可视化配置
-    save_vis: bool = True
-    vis_dir: str = "vis_classicvla_smart_history_result"
+    # 并行测试配置
+    eval_batch_size: int = 16      # 每张卡的 batch size
+    num_workers: int = 4           # 每进程 DataLoader worker 数
 
 
 def calc_l2_distance(pred, gt):
@@ -54,146 +55,84 @@ def calc_yaw_diff(pred, gt):
 
 
 def parse_output(text: str):
-    """从生成文本中提取 decision 和 trajectory，失败返回 None。"""
-    m = re.search(r'\{.*\}', text, re.DOTALL)
+    """从生成文本中提取 decision 和 trajectory，失败返回 None。
+
+    处理 VLM 文本输出的边界情况：
+      - 去除 markdown ``` 围栏；
+      - 非贪婪匹配第一个完整 {...}（trajectory 内仅数字数组、无嵌套花括号）；
+      - JSON 解析、键缺失、类型错误统一兜底为 None；
+      - 形状必须为 (FUTURE_ACTION_WAYPOINTS, ACTION_DIM)；
+      - 数值必须全部有限（拦截 NaN/Inf，避免污染 np.mean）。
+    """
+    if not text:
+        return None
+    # 去掉 ```json / ``` 等 markdown 围栏
+    text = text.replace("```json", " ").replace("```", " ")
+    m = re.search(r'\{.*?\}', text, re.DOTALL)
     if not m:
         return None
     try:
         obj = json.loads(m.group())
-        print(f"Parsed JSON object: {obj}")
         decision = int(obj['decision'])
         traj = torch.tensor(obj['trajectory'], dtype=torch.float32)  # [8, 4]
         if traj.shape != (FUTURE_ACTION_WAYPOINTS, ACTION_DIM):
+            return None
+        if not torch.isfinite(traj).all():
             return None
         return decision, traj
     except Exception:
         return None
 
 
-def evaluate_one_traj(cfg, vla, tokenizer, pad_token_id, traj_dir, device):
-    """评测单条轨迹，返回该轨迹的指标字典（含可写文件的文本块）。"""
-    dataset = SingleTrajClassicTestDataset(
-        traj_dir=traj_dir,
-        tokenizer=tokenizer,
-        image_transform=cfg._image_transform,
-        max_history=cfg.max_history,
-        future_steps=cfg.future_steps,
-        history_mode=cfg.history_mode,
-        distance_interval=cfg.distance_interval,
-        turn_yaw_thresh=cfg.turn_yaw_thresh,
-        turn_dense_interval=cfg.turn_dense_interval,
-    )
-    dataloader = DataLoader(
-        dataset, batch_size=1, shuffle=False,
-        collate_fn=lambda b: classic_collate_fn(b, pad_token_id),
-    )
+def evaluate_sample(gen_text, gt_action, gt_decision):
+    """对单个样本的生成文本计算指标，返回 per-sample 指标字典。"""
+    parsed = parse_output(gen_text)
+    if parsed is None:
+        parse_fail = 1
+        pred_actions = torch.zeros(8, 4)
+        pred_decision = -1
+    else:
+        parse_fail = 0
+        pred_decision, pred_actions = parsed
+        pred_actions = pred_actions.float()
 
-    traj_l2_1s, traj_l2_2s, traj_l2_3s = [], [], []
-    traj_yaw_1s, traj_yaw_2s, traj_yaw_3s = [], [], []
-    traj_inf_time = []
-    correct_decision = 0
-    parse_fails = 0
-    total_steps = len(dataset)
-    last_step_success = False
+    pred_point_1s = pred_actions[1, 0:4]
+    pred_point_2s = pred_actions[3, 0:4]
+    pred_point_3s = pred_actions[5, 0:4]
+    gt_point_1s = gt_action[1, 0:4].cpu().float()
+    gt_point_2s = gt_action[3, 0:4].cpu().float()
+    gt_point_3s = gt_action[5, 0:4].cpu().float()
 
-    for step, batch in enumerate(dataloader):
-        for k in ['pixel_values_front', 'pixel_values_rear', 'pixel_values_left', 'pixel_values_right']:
-            batch[k] = batch[k].to(device)
+    return {
+        "l2_1s": calc_l2_distance(pred_point_1s, gt_point_1s),
+        "l2_2s": calc_l2_distance(pred_point_2s, gt_point_2s),
+        "l2_3s": calc_l2_distance(pred_point_3s, gt_point_3s),
+        "yaw_1s": calc_yaw_diff(pred_point_1s, gt_point_1s),
+        "yaw_2s": calc_yaw_diff(pred_point_2s, gt_point_2s),
+        "yaw_3s": calc_yaw_diff(pred_point_3s, gt_point_3s),
+        "decision_correct": 1 if pred_decision == gt_decision else 0,
+        "parse_fail": parse_fail,
+    }
 
-        gt_action = batch['action_gt'].to(device).to(torch.float32)  # [1, 8, 4]
-        gt_decision = batch['decision_gt'][0].item()
 
-        start_time = time.time()
-        with torch.no_grad():
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                gen_ids = vla.generate_answer(batch, max_new_tokens=cfg.max_new_tokens)
+def aggregate_traj(traj_name, records):
+    """将某条轨迹的所有 per-sample record 聚合成该轨迹的指标块。"""
+    records = sorted(records, key=lambda r: r["step_idx"])
+    total_steps = len(records)
 
-        gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-        print(f"Step {step+1}/{total_steps} - Generated Text:\n{gen_text}\n")
-        end_time = time.time()
-        traj_inf_time.append(end_time - start_time)
+    def mean(key):
+        return float(np.mean([r[key] for r in records]))
 
-        parsed = parse_output(gen_text)
+    avg_l2_1s, avg_l2_2s, avg_l2_3s = mean("l2_1s"), mean("l2_2s"), mean("l2_3s")
+    avg_yaw_1s, avg_yaw_2s, avg_yaw_3s = mean("yaw_1s"), mean("yaw_2s"), mean("yaw_3s")
+    avg_inf_time = mean("inf_time")
+    dec_acc = mean("decision_correct")
+    parse_fail_rate = mean("parse_fail")
 
-        if parsed is None:
-            parse_fails += 1
-            # 解析失败时用全零轨迹填充，不影响其他步骤统计
-            pred_actions = torch.zeros(8, 4)
-            pred_decision = -1
-        else:
-            pred_decision, pred_actions = parsed
-            pred_actions = pred_actions.float()
+    # Parking Success：该轨迹末帧 decision 是否正确
+    last_records = [r for r in records if r["is_last"]]
+    last_step_success = bool(last_records[0]["decision_correct"]) if last_records else False
 
-        pred_point_1s = pred_actions[1, 0:4]
-        pred_point_2s = pred_actions[3, 0:4]
-        pred_point_3s = pred_actions[5, 0:4]
-        gt_point_1s = gt_action[0, 1, 0:4].cpu().float()
-        gt_point_2s = gt_action[0, 3, 0:4].cpu().float()
-        gt_point_3s = gt_action[0, 5, 0:4].cpu().float()
-
-        traj_l2_1s.append(calc_l2_distance(pred_point_1s, gt_point_1s))
-        traj_l2_2s.append(calc_l2_distance(pred_point_2s, gt_point_2s))
-        traj_l2_3s.append(calc_l2_distance(pred_point_3s, gt_point_3s))
-        traj_yaw_1s.append(calc_yaw_diff(pred_point_1s, gt_point_1s))
-        traj_yaw_2s.append(calc_yaw_diff(pred_point_2s, gt_point_2s))
-        traj_yaw_3s.append(calc_yaw_diff(pred_point_3s, gt_point_3s))
-
-        if pred_decision == gt_decision:
-            correct_decision += 1
-
-        if step == total_steps - 1:
-            last_step_success = (pred_decision == gt_decision)
-
-        # Use visualization
-        if cfg.save_vis:
-            v_dir = cfg.vis_dir
-            if not os.path.isabs(v_dir):
-                out_dir = os.path.dirname(cfg.output_file)
-                v_dir = os.path.join(out_dir, v_dir) if out_dir else v_dir
-
-            traj_name = os.path.basename(traj_dir)
-            vis_save_path = os.path.join(v_dir, traj_name, f"step_{step}.png")
-            instruction = batch.get('instruction', [""])[0] if 'instruction' in batch else "No instruction"
-
-            history_traj = None
-            p_hist_ids = batch.get('p_hist_ids')
-            if p_hist_ids is not None:
-                hist_text = tokenizer.decode(p_hist_ids[0], skip_special_tokens=True)
-                matches = re.findall(r'\[([^\]]+)\]', hist_text.replace("History trajectory:", ""))
-                pts = []
-                for m in matches:
-                    try:
-                        pts.append([float(x) for x in m.split(',')])
-                    except ValueError:
-                        pass
-                if pts:
-                    history_traj = torch.tensor(pts, dtype=torch.float32)
-
-            visualize_test_expvla(
-                vis_save_path,
-                pred_actions,
-                gt_action[0],
-                history_traj,
-                str(pred_decision) if pred_decision != -1 else "Parse Fail",
-                str(gt_decision),
-                instruction,
-                batch['pixel_values_front'][0] if 'pixel_values_front' in batch else torch.zeros(3, 224, 224),
-                batch['pixel_values_rear'][0] if 'pixel_values_rear' in batch else torch.zeros(3, 224, 224),
-                batch['pixel_values_left'][0] if 'pixel_values_left' in batch else torch.zeros(3, 224, 224),
-                batch['pixel_values_right'][0] if 'pixel_values_right' in batch else torch.zeros(3, 224, 224)
-            )
-
-    avg_l2_1s = float(np.mean(traj_l2_1s))
-    avg_l2_2s = float(np.mean(traj_l2_2s))
-    avg_l2_3s = float(np.mean(traj_l2_3s))
-    avg_yaw_1s = float(np.mean(traj_yaw_1s))
-    avg_yaw_2s = float(np.mean(traj_yaw_2s))
-    avg_yaw_3s = float(np.mean(traj_yaw_3s))
-    avg_inf_time = float(np.mean(traj_inf_time))
-    dec_acc = correct_decision / total_steps
-    parse_fail_rate = parse_fails / total_steps
-
-    traj_name = os.path.basename(traj_dir)
     text_block = (
         f"Traj: {traj_name}\n"
         f"  L2 Dist 1s: {avg_l2_1s:.4f} m | 2s: {avg_l2_2s:.4f} m | 3s: {avg_l2_3s:.4f} m\n"
@@ -235,7 +174,7 @@ def evaluate(cfg: ClassicVLATestConfig):
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     tokenizer = processor.tokenizer
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id else 0
-    cfg._image_transform = processor.image_processor.apply_transform
+    image_transform = processor.image_processor.apply_transform
 
     vla = ClassicVLAForActionPrediction.from_pretrained(
         cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
@@ -248,42 +187,94 @@ def evaluate(cfg: ClassicVLATestConfig):
 
     vla.eval()
 
-    traj_dirs = sorted([
-        os.path.join(cfg.data_root, d)
-        for d in os.listdir(cfg.data_root)
-        if os.path.isdir(os.path.join(cfg.data_root, d))
-    ])
+    # === 全轨迹测试集：所有轨迹的所有帧展开为统一样本集 ===
+    dataset = MultiTrajClassicTestDataset(
+        data_root=cfg.data_root,
+        tokenizer=tokenizer,
+        image_transform=image_transform,
+        max_history=cfg.max_history,
+        future_steps=cfg.future_steps,
+        history_mode=cfg.history_mode,
+        distance_interval=cfg.distance_interval,
+        turn_yaw_thresh=cfg.turn_yaw_thresh,
+        turn_dense_interval=cfg.turn_dense_interval,
+    )
 
-    # 轨迹按 rank round-robin 切分（单卡时 num_processes=1 → 全量）
-    my_traj_dirs = traj_dirs[distributed_state.process_index::distributed_state.num_processes]
+    # 样本级数据并行：按 rank round-robin 切分（单卡时 num_processes=1 → 全量）
+    my_indices = list(range(distributed_state.process_index, len(dataset), distributed_state.num_processes))
+    subset = Subset(dataset, my_indices)
+    dataloader = DataLoader(
+        subset,
+        batch_size=cfg.eval_batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        collate_fn=lambda b: classic_collate_fn(b, pad_token_id),
+    )
 
     local_records = []
-    for traj_dir in tqdm(my_traj_dirs, desc=f"[rank {distributed_state.process_index}] Testing"):
-        local_records.append(
-            evaluate_one_traj(cfg, vla, tokenizer, pad_token_id, traj_dir, device)
-        )
+    for batch in tqdm(
+        dataloader,
+        desc=f"[rank {distributed_state.process_index}] Testing",
+        disable=not distributed_state.is_main_process,
+    ):
+        for k in ['pixel_values_front', 'pixel_values_rear', 'pixel_values_left', 'pixel_values_right']:
+            batch[k] = batch[k].to(device)
 
-    # 汇总到所有进程（单卡时原样返回）
+        gt_action = batch['action_gt'].to(torch.float32)          # [B, 8, 4]
+        gt_decision = batch['decision_gt']                        # [B]
+        traj_names = batch['traj_name']                           # list[str]
+        step_idxs = batch['step_idx']                             # [B]
+        is_last = batch['is_last']                                # [B]
+        bsz = gt_action.shape[0]
+
+        start_time = time.time()
+        with torch.no_grad():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                gen_ids = vla.generate_answer(batch, max_new_tokens=cfg.max_new_tokens)
+        per_sample_time = (time.time() - start_time) / bsz
+
+        gen_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+
+        for i in range(bsz):
+            metrics = evaluate_sample(gen_texts[i], gt_action[i], gt_decision[i].item())
+            metrics.update({
+                "traj_name": traj_names[i],
+                "step_idx": int(step_idxs[i].item()),
+                "is_last": bool(is_last[i].item()),
+                "inf_time": per_sample_time,
+            })
+            local_records.append(metrics)
+
+    # 汇总所有 rank 的 per-sample record（单卡时原样返回）
     distributed_state.wait_for_everyone()
     all_records = gather_object(local_records)
 
     if not distributed_state.is_main_process:
         return
 
-    # 恢复确定性顺序
-    all_records.sort(key=lambda r: r["name"])
+    # 按轨迹分组聚合
+    grouped = defaultdict(list)
+    for r in all_records:
+        grouped[r["traj_name"]].append(r)
+
+    traj_results = [aggregate_traj(name, recs) for name, recs in grouped.items()]
+    traj_results.sort(key=lambda r: r["name"])
 
     def col(key):
-        return [r[key] for r in all_records]
+        return [r[key] for r in traj_results]
 
+    out_dir = os.path.dirname(cfg.output_file)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(cfg.output_file, 'w') as f:
         f.write("========== ClassicVLA Evaluation Results ==========\n\n")
-        for r in all_records:
+        for r in traj_results:
             f.write(r["text"])
 
         summary = (
             "========== Global Summary ==========\n"
-            f"Total Trajectories Evaluated: {len(all_records)}\n"
+            f"Total Trajectories Evaluated: {len(traj_results)}\n"
             f"Average L2 Dist 1s (2nd pt):   {np.mean(col('l2_1s')):.4f} m\n"
             f"Average L2 Dist 2s (4th pt):   {np.mean(col('l2_2s')):.4f} m\n"
             f"Average L2 Dist 3s (6th pt):   {np.mean(col('l2_3s')):.4f} m\n"

@@ -44,8 +44,8 @@ from core.constants import ACTION_DIM, FUTURE_ACTION_WAYPOINTS
 class LangParkVLAConfig:
     # Paths
     vla_path:     str  = "/root/autodl-tmp/codes/OmniVLA/openvla-7b"
-    data_root:    str  = "/root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA"
-    run_root_dir: Path = Path("runs/runs_langpark")
+    data_root:    str  = "/root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA_testsets"
+    run_root_dir: Path = Path("runs/runs_langpark_additional")
 
     # Training
     # batch_size is per-GPU. Recommended configs (H20-96GB, LoRA):
@@ -56,10 +56,10 @@ class LangParkVLAConfig:
     batch_size:              int   = 4
     learning_rate:           float = 1.4e-4
     grad_accumulation_steps: int   = 4
-    epochs:                  int   = 6
-    save_freq:               int   = 2048    # in optimizer steps
-    resume:                  bool  = False
-    resume_dir:              str   = ""
+    epochs:                  int   = 1
+    save_freq:               int   = 512    # in optimizer steps
+    resume:                  bool  = True
+    resume_dir:              str   = "/root/autodl-tmp/codes/OmniVLA/runs/runs_langpark/2026-06-12_20-08/step_12048_loss_0.0326_ckpt"
     num_workers:             int   = 4     # per process
 
     # LR schedule, as fractions of total optimizer steps:

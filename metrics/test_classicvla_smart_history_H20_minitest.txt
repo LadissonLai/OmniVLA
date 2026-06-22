@@ -1,0 +1,86 @@
+========== ClassicVLA Evaluation Results ==========
+
+Traj: 2026-03-29-15-56-1
+  L2 Dist 1s: 0.6911 m | 2s: 1.7219 m | 3s: 2.6378 m
+  Yaw Err 1s: 0.0001 rad | 2s: 0.0003 rad | 3s: 0.0003 rad
+  Decision Acc: 100.00%
+  Avg Inference Time: 1.7228 s/step
+  Parking Success: Yes
+  Parse Fail Rate: 0.00%
+
+Traj: 2026-03-29-15-58-1
+  L2 Dist 1s: 0.5279 m | 2s: 1.4042 m | 3s: 2.4550 m
+  Yaw Err 1s: 0.0000 rad | 2s: 0.0000 rad | 3s: 0.0000 rad
+  Decision Acc: 100.00%
+  Avg Inference Time: 1.6962 s/step
+  Parking Success: Yes
+  Parse Fail Rate: 0.00%
+
+Traj: 2026-03-29-16-06
+  L2 Dist 1s: 0.5897 m | 2s: 1.5029 m | 3s: 2.5470 m
+  Yaw Err 1s: 0.0001 rad | 2s: 0.0001 rad | 3s: 0.0001 rad
+  Decision Acc: 84.00%
+  Avg Inference Time: 1.6942 s/step
+  Parking Success: Yes
+  Parse Fail Rate: 0.00%
+
+Traj: 2026-03-29-16-08
+  L2 Dist 1s: 0.5043 m | 2s: 1.0954 m | 3s: 1.5175 m
+  Yaw Err 1s: 0.0001 rad | 2s: 0.0002 rad | 3s: 0.0002 rad
+  Decision Acc: 86.21%
+  Avg Inference Time: 1.6946 s/step
+  Parking Success: Yes
+  Parse Fail Rate: 0.00%
+
+Traj: 2026-05-24-21-32
+  L2 Dist 1s: 0.2061 m | 2s: 0.4275 m | 3s: 0.6231 m
+  Yaw Err 1s: 0.0001 rad | 2s: 0.0002 rad | 3s: 0.0002 rad
+  Decision Acc: 91.89%
+  Avg Inference Time: 1.7456 s/step
+  Parking Success: No
+  Parse Fail Rate: 0.00%
+
+Traj: 2026-06-10-22-38
+  L2 Dist 1s: 0.2461 m | 2s: 0.5584 m | 3s: 0.8714 m
+  Yaw Err 1s: 0.0141 rad | 2s: 0.0320 rad | 3s: 0.0519 rad
+  Decision Acc: 98.25%
+  Avg Inference Time: 2.0009 s/step
+  Parking Success: Yes
+  Parse Fail Rate: 0.00%
+
+Traj: 2026-06-10-22-38-1
+  L2 Dist 1s: 0.2484 m | 2s: 0.5602 m | 3s: 0.8626 m
+  Yaw Err 1s: 0.0152 rad | 2s: 0.0287 rad | 3s: 0.0482 rad
+  Decision Acc: 97.37%
+  Avg Inference Time: 2.2419 s/step
+  Parking Success: Yes
+  Parse Fail Rate: 0.00%
+
+Traj: 2026-06-10-22-38-2
+  L2 Dist 1s: 0.2526 m | 2s: 0.5725 m | 3s: 0.8822 m
+  Yaw Err 1s: 0.0136 rad | 2s: 0.0259 rad | 3s: 0.0369 rad
+  Decision Acc: 98.25%
+  Avg Inference Time: 2.2509 s/step
+  Parking Success: Yes
+  Parse Fail Rate: 0.00%
+
+Traj: 2026-06-10-22-38-3
+  L2 Dist 1s: 0.2472 m | 2s: 0.5737 m | 3s: 0.8901 m
+  Yaw Err 1s: 0.0125 rad | 2s: 0.0270 rad | 3s: 0.0442 rad
+  Decision Acc: 98.25%
+  Avg Inference Time: 2.4477 s/step
+  Parking Success: Yes
+  Parse Fail Rate: 0.00%
+
+========== Global Summary ==========
+Total Trajectories Evaluated: 9
+Average L2 Dist 1s (2nd pt):   0.3904 m
+Average L2 Dist 2s (4th pt):   0.9352 m
+Average L2 Dist 3s (6th pt):   1.4763 m
+Average Yaw Err 1s (2nd pt):   0.0062 rad
+Average Yaw Err 2s (4th pt):   0.0127 rad
+Average Yaw Err 3s (6th pt):   0.0202 rad
+Average Decision Accuracy:     94.91%
+Global Average Inference Time: 1.9439 s/step
+Parking Success Rate:          88.89%
+Average Parse Fail Rate:       0.00%

@@ -75,11 +75,11 @@ class LangParkAlignOnlyConfig:
     batch_size:              int   = 4
     learning_rate:           float = 1.4e-4
     grad_accumulation_steps: int   = 4
-    epochs:                  int   = 6
-    save_freq:               int   = 2048    # in optimizer steps
+    epochs:                  int   = 4
+    save_freq:               int   = 1024    # in optimizer steps
     resume:                  bool  = False
     resume_dir:              str   = ""
-    num_workers:             int   = 4     # per process
+    num_workers:             int   = 6     # per process
 
     # LR schedule, as fractions of total optimizer steps:
     # linear warm-up from 10% to 100% LR over the first warmup_ratio of training,

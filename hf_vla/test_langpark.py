@@ -26,12 +26,12 @@ from core.constants import ACTION_DIM, FUTURE_ACTION_WAYPOINTS
 class TestLangParkConfig:
     # Paths
     vla_path:    str = "/root/autodl-tmp/codes/OmniVLA/openvla-7b"
-    resume_dir:  str = "/root/autodl-tmp/codes/OmniVLA/runs/runs_langpark/2026-06-12_20-08/step_10240_loss_0.0284_ckpt"
+    resume_dir:  str = "/root/autodl-tmp/codes/OmniVLA/runs/runs_langpark_additional/2026-06-22_16-27/step_759_loss_0.0957_ckpt"
     data_root:   str = "/root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA_testsets/"
-    output_file: str = "metrics/test_langpark_4H20_6epoch2.txt"
+    output_file: str = "metrics/test_langpark_4H20_add2epoch.txt"
 
     # DataLoader
-    batch_size:  int = 20
+    batch_size:  int = 18
     num_workers: int = 4
 
     # History config (must match training)

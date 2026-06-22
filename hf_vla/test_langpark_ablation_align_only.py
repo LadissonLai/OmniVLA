@@ -39,12 +39,12 @@ from core.constants import ACTION_DIM, FUTURE_ACTION_WAYPOINTS
 class TestLangParkAlignOnlyConfig:
     # Paths
     vla_path:    str = "/root/autodl-tmp/codes/OmniVLA/openvla-7b"
-    resume_dir:  str = ""   # set to the ablation_align_only checkpoint dir
+    resume_dir:  str = "/root/autodl-tmp/codes/OmniVLA/runs/runs_langpark_ablation_align_only/2026-06-18_04-59/step_6424_loss_0.0785_ckpt"   # set to the ablation_align_only checkpoint dir
     data_root:   str = "/root/autodl-tmp/codes/OmniVLA/datasets/ParkingVLA_testsets/"
     output_file: str = "metrics/test_langpark_ablation_align_only.txt"
 
     # DataLoader
-    batch_size:  int = 24
+    batch_size:  int = 18
     num_workers: int = 4
 
     # History config (must match training)
